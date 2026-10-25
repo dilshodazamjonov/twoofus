@@ -1,0 +1,23 @@
+# For deploy/render/Dockerfile (built from the repo root): only what it copies.
+# Never send secrets, the local database or local builds.
+*
+!backend/pyproject.toml
+!backend/uv.lock
+!backend/alembic.ini
+!backend/alembic/
+!backend/app/
+!frontend/
+!deploy/render/start.sh
+**/__pycache__
+**/*.pyc
+frontend/node_modules
+frontend/.next
+frontend/.next-*
+frontend/.env
+frontend/.env.*
+frontend/test-results
+frontend/playwright-report
+frontend/blob-report
+frontend/playwright/.auth
+frontend/coverage
+frontend/*.tsbuildinfo

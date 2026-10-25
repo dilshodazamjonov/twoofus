@@ -1,0 +1,26 @@
+# Free hosting: one Render web service (deploy/render/Dockerfile), database on Neon.
+# Render: New > Blueprint > this repo. It asks for DATABASE_URL (the Neon
+# connection string) and SPOTIFY_CLIENT_ID; the other secrets are generated.
+# Free plan: sleeps after 15 idle minutes, the next visit wakes it (about a minute).
+services:
+  - type: web
+    name: twoofus
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./deploy/render/Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: TOKEN_ENCRYPTION_KEYS
+        generateValue: true
+      - key: PROXY_SHARED_SECRET
+        generateValue: true
+      - key: APP_NAME
+        value: Two of Us
