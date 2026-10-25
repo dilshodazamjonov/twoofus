@@ -7,6 +7,7 @@ authorisations are bound to the app session that started them.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context import AppContext
 from app.core.crypto import DecryptionError
-from app.core.errors import NotFound, ServiceUnavailable
+from app.core.errors import Conflict, NotFound, ServiceUnavailable
 from app.core.security import hash_token, new_token
 from app.models import (
     AuthFlowKind,
@@ -29,6 +30,7 @@ from app.models import (
     ProviderName,
 )
 from app.providers.base import ProviderError, TokenSet
+from app.providers.demo import DemoProvider, DemoScenario
 from app.providers.spotify import code_challenge_s256, new_code_verifier
 from app.providers.yandex import DeviceFlowError, DeviceFlowPending
 from app.services.credentials import flow_context, token_context
@@ -37,11 +39,35 @@ logger = logging.getLogger(__name__)
 
 SPOTIFY_FLOW_TTL = timedelta(minutes=10)
 _YANDEX_UNREACHABLE_BACKOFF = 10
+_REVOKE_TIMEOUT_SECONDS = 5.0
 
 
 class ProviderUnavailable(ServiceUnavailable):
     code = "provider_not_available"
     message = "This music service is not enabled on this server."
+
+
+class Revocation(StrEnum):
+    """What happened to the grant at the provider when we dropped our copy."""
+
+    REVOKED = "revoked"  # the provider confirmed the token is invalid now
+    FAILED = "failed"  # we asked, it did not confirm (our copy is deleted anyway)
+    NOT_SUPPORTED = "not_supported"  # Spotify has no revocation API: spotify.com/account/apps
+    NOT_APPLICABLE = "not_applicable"  # demo, or nothing usable was stored
+
+
+@dataclass(frozen=True, slots=True)
+class DisconnectResult:
+    provider: str | None
+    revocation: Revocation | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredGrant:
+    """A provider and its decrypted access token, kept just long enough to revoke it."""
+
+    provider: str
+    access_token: str | None
 
 
 class CallbackResult(StrEnum):
@@ -61,6 +87,45 @@ async def get_connection(db: AsyncSession, user_id: uuid.UUID) -> ProviderConnec
     ).scalar_one_or_none()
 
 
+def stored_grant(ctx: AppContext, conn: ProviderConnection) -> StoredGrant:
+    access: str | None = None
+    if conn.access_token_enc is not None:
+        try:
+            access = ctx.cipher.decrypt(
+                conn.access_token_enc, context=token_context(conn.user_id, conn.provider, "access")
+            )
+        except DecryptionError:
+            access = None
+    return StoredGrant(provider=conn.provider, access_token=access)
+
+
+async def revoke_at_provider(ctx: AppContext, grant: StoredGrant | None) -> Revocation | None:
+    """Best effort, called after our copy is already deleted; never raises.
+
+    Yandex ID revokes tokens issued for a device (ours are); Spotify's Web API
+    has no revocation endpoint, so the person removes the app at
+    spotify.com/account/apps (the UI says so).
+    """
+    if grant is None:
+        return None
+    if grant.provider == ProviderName.SPOTIFY.value:
+        return Revocation.NOT_SUPPORTED
+    if grant.provider != ProviderName.YANDEX.value or not grant.access_token:
+        return Revocation.NOT_APPLICABLE
+    yandex = ctx.providers.yandex
+    if yandex is None:
+        return Revocation.FAILED
+    try:
+        async with asyncio.timeout(_REVOKE_TIMEOUT_SECONDS):
+            confirmed = await yandex.revoke(grant.access_token)
+    except Exception as exc:  # best effort: never let this break a disconnect
+        logger.warning("Yandex revocation call failed: %s", type(exc).__name__)
+        return Revocation.FAILED
+    if not confirmed:
+        logger.warning("Yandex did not confirm the token revocation")
+    return Revocation.REVOKED if confirmed else Revocation.FAILED
+
+
 async def store_connection(
     db: AsyncSession,
     ctx: AppContext,
@@ -68,13 +133,24 @@ async def store_connection(
     user_id: uuid.UUID,
     provider: ProviderName,
     tokens: TokenSet | None,
-) -> ProviderConnection:
-    """Create or replace the user's (single) provider connection."""
+) -> tuple[ProviderConnection, StoredGrant | None]:
+    """Create or replace the user's (single) provider connection.
+
+    Returns the connection and, when an older grant was replaced, that grant so
+    the caller can revoke it after committing (only if it differs from the new
+    token: Yandex may hand out the same token again for the same device).
+    """
     now = ctx.clock()
     conn = await get_connection(db, user_id)
+    replaced: StoredGrant | None = None
     if conn is None:
         conn = ProviderConnection(user_id=user_id, created_at=now, token_version=0)
         db.add(conn)
+    else:
+        old = stored_grant(ctx, conn)
+        new_access = tokens.access_token if tokens else None
+        if old.access_token and old.access_token != new_access:
+            replaced = old
     conn.provider = provider.value
     conn.status = ConnectionStatus.ACTIVE.value
     conn.access_token_enc = (
@@ -100,34 +176,71 @@ async def store_connection(
     conn.updated_at = now
     await db.flush()
     ctx.now_playing.evict(conn.id)
-    return conn
+    return conn, replaced
 
 
-async def disconnect(db: AsyncSession, ctx: AppContext, user_id: uuid.UUID) -> bool:
-    """Delete stored credentials and cancel pending authorisations.
-
-    Note: this forgets our copy of the tokens. Revoking the grant at the
-    provider is done by the user (Spotify: spotify.com/account/apps;
-    Yandex: id.yandex.ru), as documented in docs/INTEGRATIONS.md.
-    """
+async def disconnect(db: AsyncSession, ctx: AppContext, user_id: uuid.UUID) -> DisconnectResult:
+    """Delete stored credentials, cancel pending authorisations, then ask the
+    provider to revoke the grant where it supports that (Yandex)."""
     conn = await get_connection(db, user_id)
     await _cancel_pending_flows(db, ctx, user_id)
     if conn is None:
         await db.commit()
-        return False
+        return DisconnectResult(provider=None, revocation=None)
+    grant = stored_grant(ctx, conn)
     ctx.now_playing.evict(conn.id)
     await db.execute(delete(ProviderConnection).where(ProviderConnection.id == conn.id))
     await db.commit()
-    return True
+    return DisconnectResult(
+        provider=grant.provider, revocation=await revoke_at_provider(ctx, grant)
+    )
 
 
 async def connect_demo(db: AsyncSession, ctx: AppContext, user_id: uuid.UUID) -> ProviderConnection:
-    if ctx.providers.demo is None:
+    demo = ctx.providers.demo
+    if demo is None:
         raise ProviderUnavailable("Demo mode is disabled on this server.")
     await _cancel_pending_flows(db, ctx, user_id)
-    conn = await store_connection(db, ctx, user_id=user_id, provider=ProviderName.DEMO, tokens=None)
+    conn, replaced = await store_connection(
+        db, ctx, user_id=user_id, provider=ProviderName.DEMO, tokens=None
+    )
     await db.commit()
+    await revoke_at_provider(ctx, replaced)
+    demo.set_scenario(str(conn.id), "live")  # a fresh connection starts on the timeline
     return conn
+
+
+async def _demo_connection(
+    db: AsyncSession, ctx: AppContext, user_id: uuid.UUID
+) -> tuple[DemoProvider, ProviderConnection]:
+    demo = ctx.providers.demo
+    if demo is None or not ctx.settings.demo_controls_enabled:
+        raise NotFound  # development-only feature: invisible otherwise
+    conn = await get_connection(db, user_id)
+    if conn is None or conn.provider != ProviderName.DEMO.value:
+        raise Conflict("Connect the Demo service first.", code="not_demo")
+    return demo, conn
+
+
+async def demo_scenario(db: AsyncSession, ctx: AppContext, user_id: uuid.UUID) -> DemoScenario:
+    demo, conn = await _demo_connection(db, ctx, user_id)
+    return demo.scenario(str(conn.id))
+
+
+async def set_demo_scenario(
+    db: AsyncSession, ctx: AppContext, user_id: uuid.UUID, scenario: DemoScenario
+) -> DemoScenario:
+    """Pin the member's own demo connection to a scenario, effective on the next poll."""
+    demo, conn = await _demo_connection(db, ctx, user_id)
+    demo.set_scenario(str(conn.id), scenario)
+    # Start from a clean slate so the new scenario shows up immediately.
+    conn.status = ConnectionStatus.ACTIVE.value
+    conn.backoff_until = conn.reauth_required_at = None
+    conn.last_error_code = None
+    conn.consecutive_failures = 0
+    await db.commit()
+    ctx.now_playing.invalidate(conn.id)
+    return scenario
 
 
 # ----- pending flows ------------------------------------------------------------
@@ -244,11 +357,12 @@ async def complete_spotify(
         await db.commit()
         return CallbackResult.FAILED
 
-    await store_connection(
+    _, replaced = await store_connection(
         db, ctx, user_id=flow.user_id, provider=ProviderName.SPOTIFY, tokens=tokens
     )
     _finish(flow, AuthFlowStatus.COMPLETED, ctx.clock())
     await db.commit()
+    await revoke_at_provider(ctx, replaced)
     return CallbackResult.CONNECTED
 
 
@@ -285,7 +399,7 @@ async def start_yandex(
     if yandex is None:
         raise ProviderUnavailable("Yandex Music is disabled on this server.")
     try:
-        code = await yandex.start_device_flow()
+        code = await yandex.start_device_flow(user_key=str(user_id))
     except ProviderError as exc:
         raise ServiceUnavailable(
             "Yandex did not respond. Please try again in a minute.", code=exc.code
@@ -393,9 +507,12 @@ async def poll_yandex(
         refresh_token=None,  # yandex-music 3.2.2 cannot refresh; don't keep unused secrets
         expires_at=yandex.token_expiry(token),
     )
-    await store_connection(db, ctx, user_id=user_id, provider=ProviderName.YANDEX, tokens=tokens)
+    _, replaced = await store_connection(
+        db, ctx, user_id=user_id, provider=ProviderName.YANDEX, tokens=tokens
+    )
     _finish(flow, AuthFlowStatus.COMPLETED, ctx.clock())
     await db.commit()
+    await revoke_at_provider(ctx, replaced)
     return _view(flow)
 
 

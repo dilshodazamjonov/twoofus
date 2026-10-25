@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -29,7 +29,7 @@ SPOTIFY_CALLBACK_PATH = "/api/v1/providers/spotify/callback"
 SPOTIFY_SCOPES = ("user-read-currently-playing",)
 
 # Bump when the text users acknowledge before turning sharing on changes.
-SHARING_NOTICE_VERSION = "2026-10-25"
+SHARING_NOTICE_VERSION = "2026-10-25.2"
 
 _PLACEHOLDER_MARKERS = ("change_me", "changeme", "replace_me", "<", "example")
 
@@ -61,12 +61,25 @@ def _env_file() -> Path | None:
     return Path(override) if override else None
 
 
+def _secrets_dir() -> Path | None:
+    # Deployments mount secrets as files (Docker secrets, systemd credentials):
+    # TWOOFUS_SECRETS_DIR=/run/secrets reads e.g. /run/secrets/secret_key. Each
+    # file holds one value; environment variables still take precedence.
+    override = os.environ.get("TWOOFUS_SECRETS_DIR", "")
+    return Path(override) if override else None
+
+
 _SETTINGS_CONFIG = SettingsConfigDict(
     env_file=_env_file(),
     env_file_encoding="utf-8",
+    secrets_dir=_secrets_dir(),
     extra="ignore",
     case_sensitive=False,
+    # Never echo raw values (secrets included) in validation errors/tracebacks.
+    hide_input_in_errors=True,
 )
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 def normalize_database_url(value: str) -> str:
@@ -96,9 +109,12 @@ class DatabaseSettings(BaseSettings):
 class Settings(BaseSettings):
     model_config = _SETTINGS_CONFIG
 
-    app_name: str = Field(default="Two of Us", min_length=1, max_length=40)
+    app_name: str = Field(default="JustTheTwoOfUs", min_length=1, max_length=40)
     environment: Environment = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    # "json" (one object per line, for log collectors) or "text". Default:
+    # json in production, text elsewhere.
+    log_format: Literal["json", "text"] | None = None
 
     # Browser-facing origin (the Next.js app that proxies /api to FastAPI).
     public_app_url: str = "http://127.0.0.1:3000"
@@ -109,15 +125,17 @@ class Settings(BaseSettings):
     secret_key: SecretStr
     token_encryption_keys: SecretStr
 
+    # Shared secret the same-origin reverse proxy (Caddy in deploy/, or the
+    # Next.js server) adds to every request it forwards, as the
+    # X-TwoOfUs-Proxy-Auth header. When set, FastAPI refuses requests without
+    # it, so the API is reachable only through the proxy. Required in production.
+    proxy_shared_secret: SecretStr | None = None
+
     cookie_secure: bool | None = None
     session_ttl_days: int = Field(default=30, ge=1, le=365)
     session_idle_days: int = Field(default=14, ge=1, le=365)
     session_rotate_hours: int = Field(default=24, ge=1, le=24 * 30)
     invite_ttl_hours: int = Field(default=48, ge=1, le=24 * 7)
-
-    # Optional one-time token that enables POST /api/v1/setup/owner. Leave
-    # empty to allow owner creation only through the CLI.
-    bootstrap_token: SecretStr | None = None
 
     demo_mode: bool = False
 
@@ -127,8 +145,14 @@ class Settings(BaseSettings):
     yandex_enabled: bool = True
     yandex_music_web_base: str = "https://music.yandex.ru"
 
-    now_playing_ttl_seconds: int = Field(default=20, ge=15, le=60)
+    # 15-60 s protects the providers' quotas; only a local test fake may go lower.
+    now_playing_ttl_seconds: int = Field(default=20, ge=1, le=60)
     provider_timeout_seconds: float = Field(default=8.0, ge=1.0, le=30.0)
+
+    # TESTING ONLY. Sends every server-side Spotify/Yandex call to a local fake
+    # (scripts/fake_providers.py) instead of the real hosts, so the real adapter
+    # code can be exercised over HTTP. Loopback http only; refused in production.
+    provider_upstream_override: str = ""
 
     @field_validator("public_app_url", "yandex_music_web_base")
     @classmethod
@@ -158,12 +182,24 @@ class Settings(BaseSettings):
             raise ValueError("TOKEN_ENCRYPTION_KEYS still contains a placeholder value")
         self.encryption_keys()  # raises on malformed keys
 
-        if self.bootstrap_token is not None:
-            token = self.bootstrap_token.get_secret_value()
-            if token == "":
-                self.bootstrap_token = None
-            elif len(token) < 32 or any(m in token.lower() for m in _PLACEHOLDER_MARKERS):
-                raise ValueError("BOOTSTRAP_TOKEN must be empty or a random value of >= 32 chars")
+        if self.proxy_shared_secret is not None:
+            proxy_secret = self.proxy_shared_secret.get_secret_value()
+            if proxy_secret == "":
+                self.proxy_shared_secret = None
+            elif len(proxy_secret) < 32 or any(
+                m in proxy_secret.lower() for m in _PLACEHOLDER_MARKERS
+            ):
+                raise ValueError(
+                    "PROXY_SHARED_SECRET must be empty or a random value of at least 32 characters"
+                )
+
+        if self.provider_upstream_override:
+            self.provider_upstream_override = self._validated_upstream_override()
+        elif self.now_playing_ttl_seconds < 15:
+            raise ValueError(
+                "NOW_PLAYING_TTL_SECONDS must be between 15 and 60 (lower values are only "
+                "allowed against a local test fake)"
+            )
 
         if self.cookie_secure is None:
             self.cookie_secure = self.public_app_url.startswith("https://")
@@ -178,7 +214,43 @@ class Settings(BaseSettings):
                 raise ValueError("PUBLIC_APP_URL must use https:// in production")
             if not self.cookie_secure:
                 raise ValueError("COOKIE_SECURE must not be disabled in production")
+            if self.demo_mode:
+                # Invented songs must never appear in a real deployment.
+                raise ValueError("DEMO_MODE must be false in production")
+            if self.provider_upstream_override:
+                raise ValueError("PROVIDER_UPSTREAM_OVERRIDE is for local tests; leave it empty")
+            if self.proxy_shared_secret is None:
+                raise ValueError(
+                    "PROXY_SHARED_SECRET is required in production: the API must only be "
+                    "reachable through the same-origin proxy"
+                )
+            if self.log_level == "DEBUG":
+                raise ValueError("LOG_LEVEL=DEBUG is not allowed in production")
+        if self.log_format is None:
+            self.log_format = "json" if self.environment == "production" else "text"
         return self
+
+    def _validated_upstream_override(self) -> str:
+        parts = urlsplit(self.provider_upstream_override.strip())
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        if (
+            parts.scheme != "http"
+            or (parts.hostname or "").lower() not in _LOOPBACK_HOSTS
+            or port is None
+            or parts.path not in ("", "/")
+            or parts.query
+            or parts.fragment
+            or parts.username
+            or parts.password
+        ):
+            raise ValueError(
+                "PROVIDER_UPSTREAM_OVERRIDE must look like http://127.0.0.1:<port> "
+                "(a local test fake only)"
+            )
+        return f"http://{parts.netloc.lower()}"
 
     def _validate_spotify_redirect_uri(self) -> None:
         # https://developer.spotify.com/documentation/web-api/concepts/redirect_uri
@@ -223,6 +295,11 @@ class Settings(BaseSettings):
         return self.database_url.startswith("sqlite")
 
     @property
+    def demo_controls_enabled(self) -> bool:
+        """Scenario switching for the Demo provider: development/test only."""
+        return self.demo_mode and self.environment != "production"
+
+    @property
     def spotify_configured(self) -> bool:
         return bool(self.spotify_client_id and self.spotify_redirect_uri)
 
@@ -230,7 +307,28 @@ class Settings(BaseSettings):
     def secure_cookies(self) -> bool:
         return bool(self.cookie_secure)
 
+    @property
+    def upstream_override(self) -> str | None:
+        return self.provider_upstream_override or None
+
+
+class ConfigError(RuntimeError):
+    """Invalid configuration, described without echoing any configured values."""
+
+
+def describe_validation_error(exc: ValidationError) -> str:
+    lines = ["Invalid configuration (backend/.env or environment variables):"]
+    for error in exc.errors(include_url=False, include_input=False):
+        name = "_".join(str(part) for part in error["loc"]).upper()
+        message = str(error["msg"]).removeprefix("Value error, ")
+        lines.append(f"  - {name}: {message}" if name else f"  - {message}")
+    return "\n".join(lines)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings()  # required values come from the environment / backend/.env
+    """Settings from the environment / backend/.env; raises ConfigError if invalid."""
+    try:
+        return Settings()  # required values come from the environment / backend/.env
+    except ValidationError as exc:
+        raise ConfigError(describe_validation_error(exc)) from None

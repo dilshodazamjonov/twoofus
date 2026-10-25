@@ -7,7 +7,7 @@ from fastapi import APIRouter, Request, Response
 from app.api.deps import Ctx, Db, OptionalAuth, Owner, client_ip
 from app.api.routes.auth import start_session
 from app.core.errors import Conflict
-from app.core.ratelimit import INVITE_PER_IP
+from app.core.ratelimit import INVITE_CREATE_PER_USER, INVITE_PER_IP
 from app.schemas.auth import SessionOut
 from app.schemas.room import (
     InvitationAcceptIn,
@@ -28,6 +28,7 @@ router = APIRouter(tags=["invitations"])
     summary="Owner: create the (single, short-lived) partner invitation",
 )
 async def create_invitation(ctx: Ctx, db: Db, auth: Owner) -> InvitationCreatedOut:
+    ctx.rate_limiter.check(f"invite-create:user:{auth.user.id}", INVITE_CREATE_PER_USER)
     created = await invitations.create_invitation(
         db, ctx, room_id=auth.membership.room_id, owner_id=auth.user.id
     )

@@ -9,6 +9,7 @@ from app.models.enums import (
     ProviderName,
 )
 from app.models.provider import ProviderAuthFlow, ProviderConnection
+from app.models.tulip import Tulip
 from app.models.user import Room, RoomMember, User
 
 __all__ = [
@@ -24,5 +25,6 @@ __all__ = [
     "Room",
     "RoomMember",
     "SharePreference",
+    "Tulip",
     "User",
 ]

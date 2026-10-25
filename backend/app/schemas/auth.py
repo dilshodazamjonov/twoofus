@@ -14,16 +14,6 @@ class LoginIn(ApiModel):
     password: str = Field(min_length=1, max_length=256)
 
 
-class NewAccountIn(ApiModel):
-    username: str = Field(min_length=3, max_length=32)
-    display_name: str = Field(min_length=1, max_length=40)
-    password: str = Field(min_length=10, max_length=256)
-
-
-class OwnerSetupIn(NewAccountIn):
-    bootstrap_token: str = Field(min_length=32, max_length=256)
-
-
 class UserOut(OutModel):
     id: uuid.UUID
     username: str
@@ -36,6 +26,11 @@ class SessionOut(OutModel):
     user: UserOut | None = None
     session_expires_at: datetime | None = None
     csrf_token: str
+    session_expired: bool = Field(
+        default=False,
+        description="A session cookie was sent but is no longer valid (expired, revoked or "
+        "signed out elsewhere); the stale cookie is cleared.",
+    )
 
 
 class CsrfOut(OutModel):
@@ -44,4 +39,3 @@ class CsrfOut(OutModel):
 
 class SetupStatusOut(OutModel):
     owner_exists: bool
-    web_bootstrap_enabled: bool

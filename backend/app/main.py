@@ -3,6 +3,8 @@
 Run locally (behind the Next.js same-origin proxy):
     uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers \
         --forwarded-allow-ips 127.0.0.1 --no-access-log
+
+In production the API sits behind Caddy (deploy/), see docs/DEPLOYMENT.md.
 """
 
 from __future__ import annotations
@@ -10,21 +12,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from argon2 import PasswordHasher
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
 
 from app.api.router import API_PREFIX, api_router
 from app.auth.passwords import Passwords
 from app.context import AppContext
 from app.core.clock import Clock, utcnow
-from app.core.config import Settings, get_settings
+from app.core.config import ConfigError, Settings, get_settings
 from app.core.crypto import TokenCipher
 from app.core.errors import install_error_handlers
 from app.core.logging import configure_logging
+from app.core.middleware import BodyLimitMiddleware, ProxyAuthMiddleware, RequestLogMiddleware
 from app.core.ratelimit import RateLimiter
 from app.core.security import CsrfSigner
 from app.db.session import create_engine, create_session_factory
@@ -35,15 +37,9 @@ from app.services.now_playing import NowPlayingService
 
 logger = logging.getLogger("app")
 
-_SECURITY_HEADERS = {
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
-    "X-Frame-Options": "DENY",
-    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
-    "Cross-Origin-Resource-Policy": "same-origin",
-}
 _DOCS_PATHS = (f"{API_PREFIX}/docs", f"{API_PREFIX}/openapi.json")
+# Liveness stays reachable without the proxy secret (container health checks).
+_PROXY_OPEN_PATHS = frozenset({f"{API_PREFIX}/health"})
 
 
 def build_context(
@@ -94,7 +90,7 @@ def create_app(
     run_background_tasks: bool = True,
 ) -> FastAPI:
     settings = settings or get_settings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings.log_format or "text")
     ctx = build_context(
         settings, clock=clock, yandex_gateway=yandex_gateway, password_hasher=password_hasher
     )
@@ -107,11 +103,18 @@ def create_app(
             else None
         )
         logger.info(
-            "%s backend started (env=%s, providers=%s)",
+            "%s backend started (env=%s, providers=%s, proxy_auth=%s)",
             settings.app_name,
             settings.environment,
             ",".join(sorted(ctx.providers.available())) or "none",
+            "on" if settings.proxy_shared_secret is not None else "off",
         )
+        if settings.upstream_override:
+            logger.warning(
+                "TEST MODE: Spotify/Yandex calls go to the local fake at %s, not the real "
+                "services (PROVIDER_UPSTREAM_OVERRIDE)",
+                settings.upstream_override,
+            )
         try:
             yield
         finally:
@@ -135,25 +138,16 @@ def create_app(
     install_error_handlers(app)
     app.include_router(api_router)
 
-    @app.middleware("http")
-    async def headers_and_logging(
-        request: Request, call_next: Callable[[Request], Awaitable[Response]]
-    ) -> Response:
-        started = time.perf_counter()
-        response = await call_next(request)
-        if not request.url.path.startswith(_DOCS_PATHS):
-            for name, value in _SECURITY_HEADERS.items():
-                response.headers.setdefault(name, value)
-        # Path only: query strings can carry OAuth codes and state.
-        logger.info(
-            "%s %s -> %d (%.0f ms)",
-            request.method,
-            request.url.path,
-            response.status_code,
-            (time.perf_counter() - started) * 1000,
+    # Added innermost first: the request log wraps everything, so refusals by
+    # the proxy check or the body limit are logged (and get security headers).
+    app.add_middleware(BodyLimitMiddleware)
+    if settings.proxy_shared_secret is not None:
+        app.add_middleware(
+            ProxyAuthMiddleware,
+            secret=settings.proxy_shared_secret.get_secret_value(),
+            open_paths=_PROXY_OPEN_PATHS,
         )
-        return response
-
+    app.add_middleware(RequestLogMiddleware, skip_security_headers=_DOCS_PATHS)
     return app
 
 
@@ -161,7 +155,10 @@ def __getattr__(name: str) -> FastAPI:
     # `uvicorn app.main:app` builds the app lazily, so importing this module
     # (e.g. in tests or Alembic) does not require a configured environment.
     if name == "app":
-        application = create_app()
+        try:
+            application = create_app()
+        except ConfigError as exc:
+            raise SystemExit(str(exc)) from None
         globals()["app"] = application
         return application
     raise AttributeError(name)

@@ -3,16 +3,21 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import parse_qs
 
+import httpx
 import pytest
+import respx
 import yandex_music
-from yandex_music.exceptions import DeviceAuthError, NetworkError, YnisonUnauthorizedError
+from yandex_music.exceptions import NetworkError, YnisonUnauthorizedError
 from yandex_music.ynison.models import ynison_state
 
 from app.providers.base import ContentType, Credentials, PlaybackStatus, ProviderError
 from app.providers.yandex import (
+    OAUTH_BASE,
     DeviceFlowError,
     DeviceFlowPending,
     LibraryYandexGateway,
@@ -21,6 +26,9 @@ from app.providers.yandex import (
     YandexTrackMeta,
     YnisonPlayable,
     YnisonSnapshot,
+    _ynison_client_class,
+    music_app_credentials,
+    oauth_device_id,
     snapshot_from_ynison_state,
     yandex_cover_url,
     ynison_device_id,
@@ -34,14 +42,20 @@ TOKEN = Credentials(
 
 
 def test_pinned_library_version() -> None:
-    # docs/INTEGRATIONS.md documents behaviour verified against exactly this version.
+    # The integration was verified against exactly this version.
     assert yandex_music.__version__ == "3.2.2"
 
 
 def make_provider(gateway: FakeYandexGateway) -> YandexProvider:
     return YandexProvider(
-        gateway, app_name="Two of Us", web_base="https://music.yandex.ru", clock=lambda: NOW
+        gateway, app_name="JustTheTwoOfUs", web_base="https://music.yandex.ru", clock=lambda: NOW
     )
+
+
+@pytest.fixture
+async def lib_gateway() -> AsyncIterator[LibraryYandexGateway]:
+    async with httpx.AsyncClient() as http:
+        yield LibraryYandexGateway(timeout_seconds=2, http=http)
 
 
 async def test_idle_without_active_device() -> None:
@@ -155,8 +169,9 @@ async def test_gateway_errors_propagate() -> None:
 async def test_device_flow_helpers() -> None:
     gateway = FakeYandexGateway(poll_results=[None, YandexToken("tok", 31_536_000)])
     provider = make_provider(gateway)
-    code = await provider.start_device_flow()
-    assert gateway.device_names == ["Two of Us"]
+    code = await provider.start_device_flow(user_key="user-1")
+    assert gateway.device_names == ["JustTheTwoOfUs"]
+    assert gateway.device_ids == [oauth_device_id("user-1")]
     with pytest.raises(DeviceFlowPending):
         await provider.poll_device_flow(code.device_code)
     token = await provider.poll_device_flow(code.device_code)
@@ -238,44 +253,180 @@ def test_snapshot_without_active_device_or_track() -> None:
     assert snapshot_from_ynison_state(_state(index=-1), now_ms=0).playable is None
 
 
+def test_music_app_credentials_come_from_the_pinned_library() -> None:
+    client_id, client_secret = music_app_credentials()
+    assert len(client_id) == 32
+    assert len(client_secret) == 32
+
+
+def test_oauth_device_id_is_stable_and_within_yandex_limits() -> None:
+    device_id = oauth_device_id("user-1")
+    assert device_id == oauth_device_id("user-1") != oauth_device_id("user-2")
+    assert 6 <= len(device_id) <= 50
+    assert device_id.isascii()
+    assert device_id.isprintable()
+
+
+@respx.mock
+async def test_device_code_request(lib_gateway: LibraryYandexGateway) -> None:
+    route = respx.post(f"{OAUTH_BASE}/device/code").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "device_code": "dc",
+                "user_code": "1234567",
+                "verification_url": "https://ya.ru/device",
+                "expires_in": 300,
+                "interval": 5,
+            },
+        )
+    )
+    code = await lib_gateway.request_device_code(device_name="JustTheTwoOfUs", device_id="dev-1")
+    form = parse_qs(route.calls.last.request.content.decode())
+    assert form["client_id"] == [music_app_credentials()[0]]
+    assert form["device_id"] == ["dev-1"]
+    assert form["device_name"] == ["JustTheTwoOfUs"]
+    assert "client_secret" not in form  # only the token request needs it
+    assert (code.user_code, code.verification_url, code.expires_in, code.interval) == (
+        "1234567",
+        "https://ya.ru/device",
+        300,
+        5,
+    )
+
+
+@respx.mock
 @pytest.mark.parametrize(
-    ("raised", "expected"),
+    ("response", "error_code"),
     [
-        (DeviceAuthError("slow_down"), DeviceFlowPending),
-        (DeviceAuthError("expired_token: code expired"), DeviceFlowError),
-        (DeviceAuthError("access_denied"), DeviceFlowError),
-        (DeviceAuthError("invalid_client"), DeviceFlowError),
-        (NetworkError("boom"), ProviderError),
+        (httpx.Response(503), "provider_unreachable"),
+        (httpx.Response(429), "provider_unreachable"),
+        (httpx.Response(200, json={"device_code": "dc"}), "provider_bad_response"),
+        (httpx.Response(200, text="<html>"), "provider_bad_response"),
+        (httpx.Response(400, json={"error": "invalid_client"}), "provider_bad_response"),
     ],
 )
-async def test_library_gateway_maps_real_exceptions(
-    monkeypatch: pytest.MonkeyPatch, raised: Exception, expected: type[Exception]
+async def test_device_code_failures(
+    lib_gateway: LibraryYandexGateway, response: httpx.Response, error_code: str
 ) -> None:
-    async def fake_poll(self: Any, device_code: str, *args: Any, **kwargs: Any) -> Any:
-        raise raised
+    respx.post(f"{OAUTH_BASE}/device/code").mock(return_value=response)
+    with pytest.raises(ProviderError) as excinfo:
+        await lib_gateway.request_device_code(device_name="x", device_id="dev-1")
+    assert excinfo.value.code == error_code
 
-    monkeypatch.setattr(yandex_music.ClientAsync, "poll_device_token", fake_poll)
+
+@respx.mock
+async def test_device_code_network_error(lib_gateway: LibraryYandexGateway) -> None:
+    respx.post(f"{OAUTH_BASE}/device/code").mock(side_effect=httpx.ConnectError("down"))
+    with pytest.raises(ProviderError) as excinfo:
+        await lib_gateway.request_device_code(device_name="x", device_id="dev-1")
+    assert excinfo.value.code == "provider_unreachable"
+
+
+@respx.mock
+async def test_device_token_success_and_pending(lib_gateway: LibraryYandexGateway) -> None:
+    route = respx.post(f"{OAUTH_BASE}/token").mock(
+        side_effect=[
+            httpx.Response(400, json={"error": "authorization_pending"}),
+            httpx.Response(
+                200, json={"access_token": "tok", "expires_in": 100, "token_type": "bearer"}
+            ),
+        ]
+    )
+    assert await lib_gateway.poll_device_token("dc") is None
+    assert await lib_gateway.poll_device_token("dc") == YandexToken("tok", 100)
+    form = parse_qs(route.calls.last.request.content.decode())
+    client_id, client_secret = music_app_credentials()
+    assert form == {
+        "grant_type": ["device_code"],
+        "code": ["dc"],
+        "client_id": [client_id],
+        "client_secret": [client_secret],
+    }
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("response", "expected", "detail"),
+    [
+        (httpx.Response(400, json={"error": "slow_down"}), DeviceFlowPending, "slow_down"),
+        (httpx.Response(400, json={"error": "expired_token"}), DeviceFlowError, "expired"),
+        (httpx.Response(400, json={"error": "invalid_grant"}), DeviceFlowError, "expired"),
+        (httpx.Response(400, json={"error": "access_denied"}), DeviceFlowError, "denied"),
+        (httpx.Response(400, json={"error": "invalid_client"}), DeviceFlowError, "failed"),
+        (httpx.Response(400, text="not json"), DeviceFlowError, "failed"),
+        (httpx.Response(502), ProviderError, "provider_unreachable"),
+        (
+            httpx.Response(200, json={"token_type": "bearer"}),
+            ProviderError,
+            "provider_bad_response",
+        ),
+    ],
+)
+async def test_device_token_error_mapping(
+    lib_gateway: LibraryYandexGateway,
+    response: httpx.Response,
+    expected: type[Exception],
+    detail: str,
+) -> None:
+    respx.post(f"{OAUTH_BASE}/token").mock(return_value=response)
     with pytest.raises(expected) as excinfo:
-        await LibraryYandexGateway(timeout_seconds=2).poll_device_token("code")
-    if isinstance(excinfo.value, DeviceFlowPending):
-        assert excinfo.value.slow_down
-    if isinstance(excinfo.value, DeviceFlowError):
-        assert excinfo.value.code in {"expired", "denied", "failed"}
+        await lib_gateway.poll_device_token("dc")
+    error = excinfo.value
+    if isinstance(error, DeviceFlowPending):
+        assert error.slow_down
+    elif isinstance(error, DeviceFlowError | ProviderError):
+        assert error.code == detail
 
 
-async def test_library_gateway_pending_and_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    results: list[Any] = [None, yandex_music.OAuthToken(access_token="tok", expires_in=100)]
+@respx.mock
+async def test_revoke_token(lib_gateway: LibraryYandexGateway) -> None:
+    route = respx.post(f"{OAUTH_BASE}/revoke_token").mock(
+        side_effect=[
+            httpx.Response(200, json={"status": "ok"}),
+            httpx.Response(400, json={"error": "unsupported_token_type"}),
+            httpx.ConnectError("down"),
+        ]
+    )
+    assert await lib_gateway.revoke_token("tok") is True
+    form = parse_qs(route.calls[0].request.content.decode())
+    assert form["access_token"] == ["tok"]
+    assert form["client_id"] == [music_app_credentials()[0]]
+    assert await lib_gateway.revoke_token("tok") is False
+    assert await lib_gateway.revoke_token("tok") is False
 
-    async def fake_poll(self: Any, device_code: str, *args: Any, **kwargs: Any) -> Any:
-        return results.pop(0)
 
-    monkeypatch.setattr(yandex_music.ClientAsync, "poll_device_token", fake_poll)
-    gateway = LibraryYandexGateway(timeout_seconds=2)
-    assert await gateway.poll_device_token("code") is None
-    assert await gateway.poll_device_token("code") == YandexToken("tok", 100)
+def test_ynison_client_points_at_the_local_fake_only_when_overridden() -> None:
+    from yandex_music.ynison import YnisonClientAsync
+
+    assert _ynison_client_class(None) is YnisonClientAsync
+    fake = _ynison_client_class("http://127.0.0.1:8300")
+    assert issubclass(fake, YnisonClientAsync)
+    client = fake("tok", device_id="abcdef123456")
+    assert client._redirect_uri().startswith("ws://127.0.0.1:8300/yandex/ynison/")
+
+    class Redirect:
+        host = "127.0.0.1:8300/yandex/ynison-state"
+
+    assert client._state_uri(Redirect()).startswith("ws://127.0.0.1:8300/yandex/ynison-state/")
 
 
-async def test_library_gateway_maps_ynison_unauthorized(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_overridden_gateway_targets_the_fake() -> None:
+    async with httpx.AsyncClient() as http:
+        gateway = LibraryYandexGateway(
+            timeout_seconds=2, http=http, upstream_override="http://127.0.0.1:8300"
+        )
+        with respx.mock:
+            route = respx.post("http://127.0.0.1:8300/yandex/oauth/revoke_token").mock(
+                return_value=httpx.Response(200, json={"status": "ok"})
+            )
+            assert await gateway.revoke_token("tok") is True
+            assert route.called
+
+
+async def test_library_gateway_maps_ynison_unauthorized(
+    monkeypatch: pytest.MonkeyPatch, lib_gateway: LibraryYandexGateway
+) -> None:
     from contextlib import asynccontextmanager
 
     from yandex_music.ynison import YnisonClientAsync
@@ -287,14 +438,14 @@ async def test_library_gateway_maps_ynison_unauthorized(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(YnisonClientAsync, "session", fake_session)
     with pytest.raises(ProviderError) as excinfo:
-        await LibraryYandexGateway(timeout_seconds=2).fetch_player_state(
-            "tok", device_id="abcdef123456", device_title="Two of Us (read-only)"
+        await lib_gateway.fetch_player_state(
+            "tok", device_id="abcdef123456", device_title="JustTheTwoOfUs (read-only)"
         )
     assert excinfo.value.reauth_required
 
 
 async def test_library_gateway_fetch_track_with_real_models(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, lib_gateway: LibraryYandexGateway
 ) -> None:
     from yandex_music import Album, Artist, Track
 
@@ -314,7 +465,7 @@ async def test_library_gateway_fetch_track_with_real_models(
         ]
 
     monkeypatch.setattr(yandex_music.ClientAsync, "tracks", fake_tracks)
-    meta = await LibraryYandexGateway(timeout_seconds=2).fetch_track("tok", "10994777")
+    meta = await lib_gateway.fetch_track("tok", "10994777")
     assert seen == [("tok", ["10994777"])]
     assert meta == YandexTrackMeta(
         title="Real Song",
@@ -326,7 +477,9 @@ async def test_library_gateway_fetch_track_with_real_models(
     )
 
 
-async def test_library_gateway_fetch_track_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_library_gateway_fetch_track_errors(
+    monkeypatch: pytest.MonkeyPatch, lib_gateway: LibraryYandexGateway
+) -> None:
     from yandex_music.exceptions import UnauthorizedError
 
     async def unauthorized(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -334,61 +487,24 @@ async def test_library_gateway_fetch_track_errors(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(yandex_music.ClientAsync, "tracks", unauthorized)
     with pytest.raises(ProviderError) as excinfo:
-        await LibraryYandexGateway(timeout_seconds=2).fetch_track("tok", "1")
+        await lib_gateway.fetch_track("tok", "1")
     assert excinfo.value.reauth_required
 
     async def flaky(self: Any, *args: Any, **kwargs: Any) -> Any:
         raise NetworkError("down")
 
     monkeypatch.setattr(yandex_music.ClientAsync, "tracks", flaky)
-    assert await LibraryYandexGateway(timeout_seconds=2).fetch_track("tok", "1") is None
+    assert await lib_gateway.fetch_track("tok", "1") is None
 
     async def empty(self: Any, *args: Any, **kwargs: Any) -> Any:
         return []
 
     monkeypatch.setattr(yandex_music.ClientAsync, "tracks", empty)
-    assert await LibraryYandexGateway(timeout_seconds=2).fetch_track("tok", "1") is None
-
-
-async def test_library_gateway_device_code_with_real_models(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    names: list[str | None] = []
-
-    async def fake_request(
-        self: Any, device_id: Any = None, device_name: Any = None, client_id: Any = None
-    ) -> Any:
-        names.append(device_name)
-        return yandex_music.DeviceCode(
-            device_code="dc",
-            user_code="UC",
-            verification_url="https://ya.ru/device",
-            expires_in=300,
-            interval=5,
-        )
-
-    monkeypatch.setattr(yandex_music.ClientAsync, "request_device_code", fake_request)
-    code = await LibraryYandexGateway(timeout_seconds=2).request_device_code(
-        device_name="Two of Us"
-    )
-    assert names == ["Two of Us"]
-    assert (code.user_code, code.verification_url, code.expires_in, code.interval) == (
-        "UC",
-        "https://ya.ru/device",
-        300,
-        5,
-    )
-
-    async def failing(self: Any, *args: Any, **kwargs: Any) -> Any:
-        raise NetworkError("down")
-
-    monkeypatch.setattr(yandex_music.ClientAsync, "request_device_code", failing)
-    with pytest.raises(ProviderError):
-        await LibraryYandexGateway(timeout_seconds=2).request_device_code(device_name="x")
+    assert await lib_gateway.fetch_track("tok", "1") is None
 
 
 async def test_library_gateway_reads_state_through_a_session(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, lib_gateway: LibraryYandexGateway
 ) -> None:
     from contextlib import asynccontextmanager
 
@@ -415,21 +531,30 @@ async def test_library_gateway_reads_state_through_a_session(
 
     monkeypatch.setattr(YnisonClientAsync, "__init__", spy_init)
     monkeypatch.setattr(YnisonClientAsync, "session", fake_session)
-    snapshot = await LibraryYandexGateway(timeout_seconds=2).fetch_player_state(
-        "tok", device_id="abcdef123456", device_title="Two of Us (read-only)"
+    snapshot = await lib_gateway.fetch_player_state(
+        "tok", device_id="abcdef123456", device_title="JustTheTwoOfUs (read-only)"
     )
     assert snapshot.playable is not None
     assert snapshot.playable.playable_id == "10994777"
     assert created == [
         {
             "device_id": "abcdef123456",
-            "device_title": "Two of Us (read-only)",
+            "device_title": "JustTheTwoOfUs (read-only)",
             "max_reconnect_attempts": 1,
         }
     ]
 
     for error, code, retry in (
-        (YnisonServerError(message="go away", go_away_seconds=60), "provider_rate_limited", 60.0),
+        (
+            YnisonServerError(message="go away", http_code=429, go_away_seconds=60),
+            "provider_rate_limited",
+            60.0,
+        ),
+        (
+            YnisonServerError(message="unavailable", http_code=503, go_away_seconds=3600),
+            "provider_unreachable",
+            3600.0,
+        ),
         (
             YnisonServerError(message="busy", backoff_ms=[0, 1000, 5000]),
             "provider_unreachable",
@@ -447,7 +572,14 @@ async def test_library_gateway_reads_state_through_a_session(
 
         monkeypatch.setattr(YnisonClientAsync, "session", failing_session)
         with pytest.raises(ProviderError) as excinfo:
-            await LibraryYandexGateway(timeout_seconds=2).fetch_player_state(
+            await lib_gateway.fetch_player_state(
                 "tok", device_id="abcdef123456", device_title="t (read-only)"
             )
         assert (excinfo.value.code, excinfo.value.retry_after_seconds) == (code, retry)
+
+
+def test_snapshot_rejects_an_unexpected_state_object() -> None:
+    # If the unofficial library ever hands back something else, say so; never guess.
+    with pytest.raises(ProviderError) as excinfo:
+        snapshot_from_ynison_state(object(), now_ms=0)
+    assert excinfo.value.code == "provider_bad_response"

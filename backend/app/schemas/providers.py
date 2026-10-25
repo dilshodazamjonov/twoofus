@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from app.schemas.common import OutModel
+from app.schemas.common import ApiModel, OutModel
 
 ProviderLiteral = Literal["spotify", "yandex", "demo"]
 
@@ -57,6 +57,19 @@ class AuthorizeOut(OutModel):
     authorization_url: str
 
 
+class DisconnectOut(OutModel):
+    provider: ProviderLiteral | None = Field(
+        description="The service that was disconnected; null if nothing was connected."
+    )
+    provider_revocation: Literal["revoked", "failed", "not_supported", "not_applicable"] | None = (
+        Field(
+            description="Our copy is always deleted. revoked: the provider confirmed the grant is "
+            "gone (Yandex). failed: it did not confirm. not_supported: the provider has no "
+            "revocation API (Spotify: remove the app at spotify.com/account/apps)."
+        )
+    )
+
+
 class ConfigProviderOut(OutModel):
     available: bool
     experimental: bool
@@ -66,6 +79,7 @@ class ConfigOut(OutModel):
     app_name: str
     environment: str
     demo_mode: bool
+    demo_controls: bool = Field(description="Demo scenario switching (development only).")
     providers: dict[str, ConfigProviderOut]
     now_playing_ttl_seconds: int
     sharing_notice_version: str
@@ -80,3 +94,26 @@ class ReadyOut(OutModel):
     status: Literal["ready", "not_ready"]
     database: Literal["ok", "error"]
     migrations: Literal["ok", "pending", "unknown"]
+
+
+DemoScenarioLiteral = Literal[
+    "live",
+    "playing",
+    "paused",
+    "idle",
+    "non_music",
+    "private_session",
+    "rate_limited",
+    "unreachable",
+    "forbidden",
+    "reauth_required",
+]
+
+
+class DemoScenarioIn(ApiModel):
+    scenario: DemoScenarioLiteral
+
+
+class DemoScenarioOut(OutModel):
+    scenario: DemoScenarioLiteral
+    available: list[DemoScenarioLiteral]

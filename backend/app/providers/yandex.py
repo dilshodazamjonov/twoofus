@@ -8,8 +8,12 @@ is reported to the user instead of being papered over.
 
 What is used, and nothing else:
 
-* OAuth device flow (``request_device_code`` / ``poll_device_token``): the
-  user approves on Yandex's own page; we never see her password.
+* OAuth device flow on oauth.yandex.ru (documented by Yandex ID:
+  https://yandex.ru/dev/id/doc/en/codes/screen-code-oauth): the user approves
+  on Yandex's own page; we never see her password. Requests go through our own
+  HTTP client with the library's public Yandex Music app credentials.
+* Token revocation (``/revoke_token``, documented by Yandex ID for tokens
+  issued with a ``device_id``) on disconnect and account deletion.
 * Ynison, read only: connect, read the player state, disconnect. The library's
   handshake registers a *remote-control, non-player* device with
   ``is_currently_active=False``; no pause/next/volume/queue command is sent.
@@ -26,7 +30,9 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+import httpx
 
 from app.models.enums import ProviderName
 from app.providers.base import (
@@ -39,6 +45,12 @@ from app.providers.base import (
     TrackInfo,
 )
 from app.providers.urls import YANDEX_ARTWORK_HOSTS, YANDEX_LINK_HOSTS, safe_https_url
+
+if TYPE_CHECKING:
+    from yandex_music.ynison import YnisonClientAsync
+
+# Fixed upstream hosts (test fakes can replace them only outside production).
+OAUTH_BASE = "https://oauth.yandex.ru"
 
 _NUMERIC_ID = re.compile(r"\d{1,20}")
 _META_TTL_SECONDS = 6 * 3600
@@ -109,9 +121,11 @@ class DeviceFlowError(Exception):
 
 
 class YandexGateway(Protocol):
-    async def request_device_code(self, *, device_name: str) -> DeviceCode: ...
+    async def request_device_code(self, *, device_name: str, device_id: str) -> DeviceCode: ...
 
     async def poll_device_token(self, device_code: str) -> YandexToken | None: ...
+
+    async def revoke_token(self, access_token: str) -> bool: ...
 
     async def fetch_player_state(
         self, access_token: str, *, device_id: str, device_title: str
@@ -120,54 +134,168 @@ class YandexGateway(Protocol):
     async def fetch_track(self, access_token: str, track_id: str) -> YandexTrackMeta | None: ...
 
 
-# ----- real gateway backed by the yandex-music package ---------------------------
+# ----- real gateway: Yandex ID OAuth over httpx + the yandex-music package ----------
+
+
+def music_app_credentials() -> tuple[str, str]:
+    """The Yandex Music Android app's public OAuth client, as embedded in the
+    pinned yandex-music library."""
+    try:
+        from yandex_music._client_async import device_auth
+
+        return str(device_auth._DEFAULT_CLIENT_ID), str(device_auth._DEFAULT_CLIENT_SECRET)
+    except (ImportError, AttributeError) as exc:  # the library changed shape
+        raise ProviderError("provider_bad_response", "Yandex client data unavailable") from exc
+
+
+def _json_object(response: httpx.Response) -> dict[str, Any] | None:
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | str):
+        try:
+            number = int(value)
+        except ValueError:
+            return None
+        return number if number > 0 else None
+    return None
+
+
+def _ynison_client_class(upstream_override: str | None) -> type[YnisonClientAsync]:
+    from yandex_music.ynison import YnisonClientAsync
+
+    if not upstream_override:
+        return YnisonClientAsync
+    # Local test fake only (a validated loopback URL, refused in production):
+    # same library code, unencrypted WebSockets to the fake on 127.0.0.1.
+    host = upstream_override.removeprefix("http://")
+    scheme = "ws"  # loopback only; the real client keeps Yandex's wss:// URLs
+
+    class _LocalFakeYnison(YnisonClientAsync):
+        _BASE_URL = f"{scheme}://{host}/yandex/ynison"
+
+        def _state_uri(self, redirect: Any) -> str:
+            return f"{scheme}://{redirect.host}/{self._STATE_SERVICE}"
+
+    return _LocalFakeYnison
 
 
 class LibraryYandexGateway:
-    """Thin wrapper over ``yandex-music`` 3.2.2; imports lazily so the rest of the
-    app (and the test-suite) never depends on the unofficial package's internals."""
+    """Yandex ID OAuth (device flow, revocation) over our own HTTP client, and
+    the ``yandex-music`` 3.2.2 package for Ynison and track metadata. The
+    package is imported lazily so the rest of the app never depends on it."""
 
-    def __init__(self, *, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float,
+        http: httpx.AsyncClient,
+        upstream_override: str | None = None,
+    ) -> None:
         self._timeout = timeout_seconds
+        self._http = http
+        self._oauth_base = f"{upstream_override}/yandex/oauth" if upstream_override else OAUTH_BASE
+        self._api_base = f"{upstream_override}/yandex/api" if upstream_override else None
+        self._upstream_override = upstream_override
 
-    async def request_device_code(self, *, device_name: str) -> DeviceCode:
-        from yandex_music import ClientAsync
-        from yandex_music.exceptions import YandexMusicError
-
+    async def _oauth_post(self, path: str, form: dict[str, str]) -> httpx.Response:
         try:
-            async with asyncio.timeout(self._timeout):
-                code = await ClientAsync().request_device_code(device_name=device_name)
-        except (TimeoutError, YandexMusicError) as exc:
-            raise ProviderError("provider_unreachable", "device code request failed") from exc
+            return await self._http.post(
+                f"{self._oauth_base}{path}",
+                data=form,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError("provider_unreachable", f"Yandex OAuth {path} failed") from exc
+
+    async def request_device_code(self, *, device_name: str, device_id: str) -> DeviceCode:
+        client_id, _ = music_app_credentials()
+        response = await self._oauth_post(
+            "/device/code",
+            {"client_id": client_id, "device_id": device_id, "device_name": device_name},
+        )
+        body = _json_object(response)
+        if response.status_code >= 500 or response.status_code == 429:
+            raise ProviderError("provider_unreachable", f"device code: {response.status_code}")
+        fields = body or {}
+        device_code = fields.get("device_code")
+        user_code = fields.get("user_code")
+        verification_url = fields.get("verification_url")
+        expires_in = _positive_int(fields.get("expires_in"))
+        if (
+            response.status_code != 200
+            or not isinstance(device_code, str)
+            or not device_code
+            or not isinstance(user_code, str)
+            or not user_code
+            or not isinstance(verification_url, str)
+            or expires_in is None
+        ):
+            raise ProviderError("provider_bad_response", "unexpected device code response")
         return DeviceCode(
-            device_code=code.device_code,
-            user_code=code.user_code,
-            verification_url=code.verification_url,
-            expires_in=int(code.expires_in),
-            interval=max(1, int(code.interval)),
+            device_code=device_code,
+            user_code=user_code,
+            verification_url=verification_url,
+            expires_in=expires_in,
+            interval=_positive_int(fields.get("interval")) or 5,
         )
 
     async def poll_device_token(self, device_code: str) -> YandexToken | None:
-        from yandex_music import ClientAsync
-        from yandex_music.exceptions import DeviceAuthError, YandexMusicError
+        client_id, client_secret = music_app_credentials()
+        response = await self._oauth_post(
+            "/token",
+            {
+                "grant_type": "device_code",
+                "code": device_code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+        )
+        body = _json_object(response) or {}
+        if response.status_code == 200:
+            access = body.get("access_token")
+            if not isinstance(access, str) or not access:
+                raise ProviderError("provider_bad_response", "token response without a token")
+            return YandexToken(
+                access_token=access, expires_in=_positive_int(body.get("expires_in"))
+            )
+        if response.status_code >= 500 or response.status_code == 429:
+            raise ProviderError("provider_unreachable", f"device token: {response.status_code}")
+        # Error names from Yandex ID's documentation, plus RFC 8628's.
+        match body.get("error"):
+            case "authorization_pending":
+                return None
+            case "slow_down":
+                raise DeviceFlowPending(slow_down=True)
+            case "expired_token" | "invalid_grant":
+                raise DeviceFlowError("expired")
+            case "access_denied":
+                raise DeviceFlowError("denied")
+            case _:
+                raise DeviceFlowError("failed")
 
+    async def revoke_token(self, access_token: str) -> bool:
+        """Ask Yandex to invalidate the token. True only when Yandex confirms."""
+        client_id, client_secret = music_app_credentials()
         try:
-            async with asyncio.timeout(self._timeout):
-                token = await ClientAsync().poll_device_token(device_code)
-        except DeviceAuthError as exc:
-            message = str(exc)
-            if "slow_down" in message:
-                raise DeviceFlowPending(slow_down=True) from None
-            if "expired_token" in message:
-                raise DeviceFlowError("expired") from None
-            if "access_denied" in message:
-                raise DeviceFlowError("denied") from None
-            raise DeviceFlowError("failed") from None
-        except (TimeoutError, YandexMusicError) as exc:
-            raise ProviderError("provider_unreachable", "device token poll failed") from exc
-        if token is None:
-            return None
-        return YandexToken(access_token=token.access_token, expires_in=token.expires_in)
+            response = await self._oauth_post(
+                "/revoke_token",
+                {
+                    "access_token": access_token,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+            )
+        except ProviderError:
+            return False
+        return response.status_code == 200
 
     async def fetch_player_state(
         self, access_token: str, *, device_id: str, device_title: str
@@ -177,9 +305,8 @@ class LibraryYandexGateway:
             YnisonServerError,
             YnisonUnauthorizedError,
         )
-        from yandex_music.ynison import YnisonClientAsync
 
-        client = YnisonClientAsync(
+        client = _ynison_client_class(self._upstream_override)(
             access_token,
             device_id=device_id,
             device_title=device_title,
@@ -194,8 +321,12 @@ class LibraryYandexGateway:
             ) from exc
         except YnisonServerError as exc:
             if exc.go_away_seconds:
+                # "Go away for N seconds" also comes with a 503 ("temporary unavailable"),
+                # e.g. for an account Ynison won't serve; only 429 means "slow down".
+                limited = exc.http_code == 429 or exc.grpc_code == 8  # RESOURCE_EXHAUSTED
                 raise ProviderError(
-                    "provider_rate_limited", retry_after_seconds=float(exc.go_away_seconds)
+                    "provider_rate_limited" if limited else "provider_unreachable",
+                    retry_after_seconds=float(exc.go_away_seconds),
                 ) from exc
             backoff = max(exc.backoff_ms) / 1000 if exc.backoff_ms else None
             raise ProviderError("provider_unreachable", retry_after_seconds=backoff) from exc
@@ -209,7 +340,7 @@ class LibraryYandexGateway:
         try:
             async with asyncio.timeout(self._timeout):
                 # No client.init(): it would fetch account details we do not need.
-                tracks = await ClientAsync(access_token).tracks([track_id])
+                tracks = await ClientAsync(access_token, base_url=self._api_base).tracks([track_id])
         except UnauthorizedError as exc:
             raise ProviderError(
                 "provider_reauth_required", "track lookup unauthorized", reauth_required=True
@@ -235,7 +366,9 @@ def snapshot_from_ynison_state(state: object, now_ms: int) -> YnisonSnapshot:
     from yandex_music.ynison import utils
     from yandex_music.ynison.models import ynison_state
 
-    assert isinstance(state, ynison_state.PutYnisonStateResponse)
+    if not isinstance(state, ynison_state.PutYnisonStateResponse):
+        # The unofficial library changed shape: report it, never guess.
+        raise ProviderError("provider_bad_response", "unexpected Ynison state object")
     active = utils.get_active_device(state)
     has_active = active is not None and not active.is_offline
     current = utils.get_current_playable(state)
@@ -289,6 +422,16 @@ def ynison_device_id(subject_key: str) -> str:
     return hashlib.sha256(f"twoofus-ynison:{subject_key}".encode()).hexdigest()[:12]
 
 
+def oauth_device_id(user_key: str) -> str:
+    """Stable per-member OAuth ``device_id`` (6-50 printable chars per Yandex ID).
+
+    Makes the token revocable (Yandex only revokes tokens issued for a device)
+    and keeps one "JustTheTwoOfUs" entry in her Yandex ID device list instead
+    of a new one per approval.
+    """
+    return "twoofus-" + hashlib.sha256(f"twoofus-oauth:{user_key}".encode()).hexdigest()[:24]
+
+
 class YandexProvider:
     name = ProviderName.YANDEX
     experimental = True
@@ -312,8 +455,13 @@ class YandexProvider:
 
     # ----- device authorization -----------------------------------------
 
-    async def start_device_flow(self) -> DeviceCode:
-        return await self._gateway.request_device_code(device_name=self._device_name)
+    async def start_device_flow(self, *, user_key: str) -> DeviceCode:
+        return await self._gateway.request_device_code(
+            device_name=self._device_name, device_id=oauth_device_id(user_key)
+        )
+
+    async def revoke(self, access_token: str) -> bool:
+        return await self._gateway.revoke_token(access_token)
 
     async def poll_device_flow(self, device_code: str) -> YandexToken:
         """One poll. Returns the token, or raises DeviceFlowPending/DeviceFlowError."""

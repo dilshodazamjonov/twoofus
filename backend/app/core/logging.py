@@ -7,9 +7,11 @@ token field if a library or exception message happens to include one.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sys
+from datetime import UTC, datetime
 
 _PATTERNS = [
     (re.compile(r"(?i)(bearer|oauth)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [REDACTED]"),
@@ -45,9 +47,37 @@ class RedactingFilter(logging.Filter):
         return True
 
 
-def configure_logging(level: str) -> None:
+# Structured fields that may be attached with ``extra=``; nothing else is emitted.
+_EXTRA_FIELDS = ("request_id", "http_method", "http_path", "http_status", "duration_ms")
+
+
+class JsonFormatter(logging.Formatter):
+    """One JSON object per line. Runs after RedactingFilter, so the message and
+    any traceback are already scrubbed; only allow-listed extras are added."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry: dict[str, object] = {
+            "ts": datetime.fromtimestamp(record.created, UTC).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for name in _EXTRA_FIELDS:
+            value = record.__dict__.get(name)
+            if value is not None:
+                entry[name] = value
+        if record.exc_text:
+            entry["exc"] = record.exc_text
+        return json.dumps(entry, ensure_ascii=False)
+
+
+def configure_logging(level: str, fmt: str = "text") -> None:
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    handler.setFormatter(
+        JsonFormatter()
+        if fmt == "json"
+        else logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
     handler.addFilter(RedactingFilter())
 
     root = logging.getLogger()

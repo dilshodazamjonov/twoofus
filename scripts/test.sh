@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Lint, type-check and test everything. No real provider credentials needed.
-#   ./scripts/test.sh              backend (SQLite) + frontend lint/typecheck
+#   ./scripts/test.sh              backend (SQLite) + frontend lint/types/unit tests
 #   ./scripts/test.sh --build      ... plus a production `next build`
 #   ./scripts/test.sh --postgres   ... plus the backend suite on a throwaway
 #                                  PostgreSQL 18 container (needs Docker)
+#   ./scripts/test.sh --e2e        ... plus the Playwright browser tests (scripts/e2e.sh)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -13,10 +14,12 @@ export NEXT_TELEMETRY_DISABLED=1
 
 build=0
 postgres=0
+e2e=0
 for arg in "$@"; do
   case "$arg" in
     --build) build=1 ;;
     --postgres) postgres=1 ;;
+    --e2e) e2e=1 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -43,10 +46,18 @@ if [[ $postgres == 1 ]]; then
     uv run pytest -q -W error::ResourceWarning)
 fi
 
+echo "==> frontend: API types match the backend's OpenAPI document"
+(cd frontend && npm run --silent api:check)
 echo "==> frontend: eslint + tsc"
 (cd frontend && npm run lint && npm run typecheck)
+echo "==> frontend: vitest (unit + component tests)"
+(cd frontend && npm test)
 if [[ $build == 1 ]]; then
   echo "==> frontend: next build"
   (cd frontend && npm run build)
+fi
+if [[ $e2e == 1 ]]; then
+  echo "==> browser end-to-end tests (isolated servers)"
+  ./scripts/e2e.sh
 fi
 echo "All checks passed."

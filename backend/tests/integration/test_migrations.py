@@ -28,6 +28,7 @@ EXPECTED_TABLES = {
     "room_members",
     "rooms",
     "share_preferences",
+    "tulips",
     "users",
 }
 

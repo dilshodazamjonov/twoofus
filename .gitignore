@@ -38,6 +38,15 @@ frontend/out/
 # ---- Project-local toolchain & script output ------------------------------
 .tools/
 .smoke/
+.e2e/
+.prodcheck/
+.scan/
+.verify/
+frontend/test-results/
+frontend/playwright/.auth/
+frontend/playwright-report/
+frontend/blob-report/
+frontend/coverage/
 
 # ---- OS / editors ----------------------------------------------------------
 .DS_Store

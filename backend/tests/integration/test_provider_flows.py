@@ -61,7 +61,7 @@ async def test_spotify_connect_and_now_playing(
     query = await start_spotify(owner_client)
     response = await callback(owner_client, code="auth-code", state=query["state"])
     assert response.status_code == 303
-    assert response.headers["location"] == "/?connect=spotify&result=connected"
+    assert response.headers["location"] == "/connect?connect=spotify&result=connected"
     sent = parse_qs(token_route.calls.last.request.content.decode())
     assert sent["code"] == ["auth-code"]
     assert len(sent["code_verifier"][0]) >= 43
@@ -162,7 +162,7 @@ async def test_yandex_device_flow_happy_path(
     assert flow["user_code"] == "ABCD-1234"
     assert flow["verification_url"] == "https://ya.ru/device"
     assert "SECRET" not in started.text  # the device code itself never leaves the server
-    assert yandex_gateway.device_names == ["Two of Us"]
+    assert yandex_gateway.device_names == ["JustTheTwoOfUs"]
 
     # Polling early does not hit Yandex.
     early = await partner_client.post("/api/v1/providers/yandex/device-authorization/poll")
@@ -248,7 +248,7 @@ async def test_yandex_device_flow_failures(
 async def test_yandex_start_failure_is_reported(
     owner_client: ApiClient, yandex_gateway: FakeYandexGateway
 ) -> None:
-    async def boom(*, device_name: str) -> Any:
+    async def boom(*, device_name: str, device_id: str) -> Any:
         raise ProviderError("provider_unreachable")
 
     yandex_gateway.request_device_code = boom  # type: ignore[method-assign]
@@ -259,7 +259,9 @@ async def test_yandex_start_failure_is_reported(
 
 async def test_disconnect_deletes_credentials(owner_client: ApiClient, ctx: AppContext) -> None:
     await owner_client.post("/api/v1/providers/demo/connect")
-    assert (await owner_client.delete("/api/v1/providers/connection")).status_code == 204
+    response = await owner_client.delete("/api/v1/providers/connection")
+    assert response.status_code == 200
+    assert response.json() == {"provider": "demo", "provider_revocation": "not_applicable"}
     async with ctx.session_factory() as db:
         assert (await db.execute(select(ProviderConnection))).first() is None
     playback = (await owner_client.get("/api/v1/room/now-playing")).json()["me"]["playback"]

@@ -1,8 +1,7 @@
 [project]
 name = "twoofus-backend"
 version = "0.1.0"
-description = "Two of Us: private now-playing companion for exactly two people (FastAPI backend)."
-readme = "README_BACKEND.md"
+description = "JustTheTwoOfUs: private now-playing companion for exactly two people (FastAPI backend)."
 requires-python = ">=3.12"
 license = { text = "Proprietary (personal project)" }
 dependencies = [
@@ -18,7 +17,7 @@ dependencies = [
     "cryptography>=50.0.2",
     "argon2-cffi>=25.1.0,<26",
     # Unofficial, reverse-engineered client. Pinned EXACTLY on purpose: every
-    # upgrade must be re-verified against docs/INTEGRATIONS.md before bumping.
+    # upgrade must be re-verified before bumping.
     "yandex-music[async,ynison]==3.2.2",
 ]
 

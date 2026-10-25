@@ -62,3 +62,27 @@ async def test_purge_expired_rows(
     async with ctx.session_factory() as db:
         await purge_expired(db, clock)
     assert await counts() == [0, 0, 0]
+
+
+@pytest.mark.parametrize("module_name", ["bootstrap_owner", "reset_password"])
+def test_clis_report_bad_config_before_prompting(
+    module_name: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import importlib
+
+    from app.core.config import ConfigError
+
+    module = importlib.import_module(f"app.cli.{module_name}")
+
+    def bad_config() -> Any:
+        raise ConfigError("Invalid configuration (backend/.env or environment variables):\n  - X")
+
+    def no_prompts(*_: Any) -> str:
+        raise AssertionError("prompted before validating the configuration")
+
+    monkeypatch.setattr(module, "get_settings", bad_config)
+    monkeypatch.setattr("builtins.input", no_prompts)
+    monkeypatch.setattr("getpass.getpass", no_prompts)
+    argv = ["--username", "someone"] if module_name == "reset_password" else []
+    assert module.main(argv) == 2
+    assert "Invalid configuration" in capsys.readouterr().err

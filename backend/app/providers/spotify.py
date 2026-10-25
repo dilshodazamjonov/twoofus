@@ -34,9 +34,15 @@ from app.providers.base import (
 )
 from app.providers.urls import SPOTIFY_ARTWORK_HOSTS, SPOTIFY_LINK_HOSTS, safe_https_url
 
+# Fixed upstream hosts. The browser is sent to AUTHORIZE_URL; the server only
+# ever calls the token endpoint and the API host.
 AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
-TOKEN_URL = "https://accounts.spotify.com/api/token"  # noqa: S105 - URL, not a secret
-CURRENTLY_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
+ACCOUNTS_BASE = "https://accounts.spotify.com"
+API_BASE = "https://api.spotify.com"
+TOKEN_PATH = "/api/token"  # noqa: S105 - URL path, not a secret
+CURRENTLY_PLAYING_PATH = "/v1/me/player/currently-playing"
+TOKEN_URL = ACCOUNTS_BASE + TOKEN_PATH
+CURRENTLY_PLAYING_URL = API_BASE + CURRENTLY_PLAYING_PATH
 
 # Refresh a little before expiry so a request never races the deadline.
 _EXPIRY_SKEW = timedelta(seconds=60)
@@ -179,11 +185,17 @@ class SpotifyProvider:
         client_id: str,
         redirect_uri: str,
         clock: Callable[[], datetime],
+        upstream_override: str | None = None,
     ) -> None:
         self._http = http
         self._client_id = client_id
         self._redirect_uri = redirect_uri
         self._clock = clock
+        # Test fakes only (validated loopback URL, refused in production).
+        accounts = f"{upstream_override}/spotify/accounts" if upstream_override else ACCOUNTS_BASE
+        api = f"{upstream_override}/spotify/api" if upstream_override else API_BASE
+        self._token_url = accounts + TOKEN_PATH
+        self._currently_playing_url = api + CURRENTLY_PLAYING_PATH
 
     # ----- authorization -------------------------------------------------
 
@@ -228,7 +240,7 @@ class SpotifyProvider:
     ) -> TokenSet:
         try:
             response = await self._http.post(
-                TOKEN_URL,
+                self._token_url,
                 data=form,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
@@ -328,7 +340,7 @@ class SpotifyProvider:
     async def _currently_playing(self, access_token: str) -> ProviderPlayback:
         try:
             response = await self._http.get(
-                CURRENTLY_PLAYING_URL, headers={"Authorization": f"Bearer {access_token}"}
+                self._currently_playing_url, headers={"Authorization": f"Bearer {access_token}"}
             )
         except httpx.TimeoutException as exc:
             raise ProviderError("provider_unreachable", "currently-playing timed out") from exc

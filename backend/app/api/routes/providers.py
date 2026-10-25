@@ -9,12 +9,16 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import RedirectResponse
 
 from app.api.deps import Auth, Ctx, Db, OptionalAuth, client_ip
-from app.core.ratelimit import Limit
+from app.core.ratelimit import CONNECT_PER_USER, DEVICE_POLL_PER_USER, Limit
 from app.models import ProviderConnection, ProviderName
+from app.providers.demo import DEMO_SCENARIOS
 from app.schemas.providers import (
     AuthorizeOut,
     ConnectionOut,
+    DemoScenarioIn,
+    DemoScenarioOut,
     DeviceFlowOut,
+    DisconnectOut,
     PendingAuthorizationOut,
     ProviderAvailabilityOut,
     ProvidersOut,
@@ -26,8 +30,9 @@ router = APIRouter(prefix="/providers", tags=["providers"])
 
 CALLBACK_PER_IP = Limit(attempts=30, window_seconds=15 * 60)
 SPOTIFY_REFRESH_TOKEN_LIFETIME = timedelta(days=182)  # "6 months" per Spotify docs
-# Where the browser lands after the Spotify callback (the frontend owns the UI).
-POST_CONNECT_PATH = "/"
+# Where the browser lands after the Spotify callback: the frontend's connect
+# page, which shows the result (`?connect=spotify&result=...`).
+POST_CONNECT_PATH = "/connect"
 
 LABELS = {
     ProviderName.SPOTIFY: ("Spotify", True),
@@ -96,10 +101,17 @@ async def providers(ctx: Ctx, db: Db, auth: Auth) -> ProvidersOut:
     )
 
 
-@router.delete("/connection", status_code=204, summary="Disconnect and delete stored credentials")
-async def disconnect(ctx: Ctx, db: Db, auth: Auth) -> Response:
-    await provider_auth.disconnect(db, ctx, auth.user.id)
-    return Response(status_code=204)
+@router.delete(
+    "/connection",
+    response_model=DisconnectOut,
+    summary="Disconnect: delete stored credentials, and revoke them where the provider allows",
+)
+async def disconnect(ctx: Ctx, db: Db, auth: Auth) -> DisconnectOut:
+    result = await provider_auth.disconnect(db, ctx, auth.user.id)
+    return DisconnectOut(
+        provider=result.provider,  # type: ignore[arg-type]  # constrained by a CHECK
+        provider_revocation=result.revocation.value if result.revocation else None,
+    )
 
 
 # ----- Spotify ------------------------------------------------------------------
@@ -111,6 +123,7 @@ async def disconnect(ctx: Ctx, db: Db, auth: Auth) -> Response:
     summary="Start Spotify authorisation (Authorization Code + PKCE)",
 )
 async def spotify_authorize(ctx: Ctx, db: Db, auth: Auth) -> AuthorizeOut:
+    ctx.rate_limiter.check(f"connect:user:{auth.user.id}", CONNECT_PER_USER)
     url = await provider_auth.start_spotify(
         db, ctx, user_id=auth.user.id, session_id=auth.session.id
     )
@@ -156,6 +169,7 @@ async def spotify_callback(
     summary="Start Yandex device authorisation (user approves on Yandex's own page)",
 )
 async def yandex_start(ctx: Ctx, db: Db, auth: Auth) -> DeviceFlowOut:
+    ctx.rate_limiter.check(f"connect:user:{auth.user.id}", CONNECT_PER_USER)
     view = await provider_auth.start_yandex(
         db, ctx, user_id=auth.user.id, session_id=auth.session.id
     )
@@ -168,6 +182,7 @@ async def yandex_start(ctx: Ctx, db: Db, auth: Auth) -> DeviceFlowOut:
     summary="Advance the device flow (at most one upstream check per interval)",
 )
 async def yandex_poll(ctx: Ctx, db: Db, auth: Auth) -> DeviceFlowOut:
+    ctx.rate_limiter.check(f"device-poll:user:{auth.user.id}", DEVICE_POLL_PER_USER)
     view = await provider_auth.poll_yandex(
         db, ctx, user_id=auth.user.id, session_id=auth.session.id
     )
@@ -193,3 +208,23 @@ async def yandex_cancel(ctx: Ctx, db: Db, auth: Auth) -> Response:
 async def demo_connect(ctx: Ctx, db: Db, auth: Auth) -> ConnectionOut:
     conn = await provider_auth.connect_demo(db, ctx, auth.user.id)
     return connection_out(conn)
+
+
+@router.get(
+    "/demo/scenario",
+    response_model=DemoScenarioOut,
+    summary="Development only: the scenario my demo connection replays",
+)
+async def demo_scenario(ctx: Ctx, db: Db, auth: Auth) -> DemoScenarioOut:
+    scenario = await provider_auth.demo_scenario(db, ctx, auth.user.id)
+    return DemoScenarioOut(scenario=scenario, available=list(DEMO_SCENARIOS))
+
+
+@router.put(
+    "/demo/scenario",
+    response_model=DemoScenarioOut,
+    summary="Development only: pin my demo connection to a scenario (playing, 429, ...)",
+)
+async def set_demo_scenario(body: DemoScenarioIn, ctx: Ctx, db: Db, auth: Auth) -> DemoScenarioOut:
+    scenario = await provider_auth.set_demo_scenario(db, ctx, auth.user.id, body.scenario)
+    return DemoScenarioOut(scenario=scenario, available=list(DEMO_SCENARIOS))

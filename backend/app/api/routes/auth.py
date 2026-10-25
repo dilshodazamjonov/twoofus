@@ -1,4 +1,4 @@
-"""Login, logout, session introspection, CSRF token issuance, owner setup."""
+"""Login, logout, session introspection, CSRF token issuance, setup status."""
 
 from __future__ import annotations
 
@@ -17,14 +17,12 @@ from app.auth.sessions import (
     set_session_cookie,
 )
 from app.context import AppContext
-from app.core.errors import AppError, NotFound
-from app.core.ratelimit import BOOTSTRAP_PER_IP, LOGIN_PER_IP, LOGIN_PER_USERNAME
-from app.core.security import tokens_equal
+from app.core.errors import AppError
+from app.core.ratelimit import LOGIN_PER_IP, LOGIN_PER_USERNAME
 from app.models import RoomMember, User
 from app.schemas.auth import (
     CsrfOut,
     LoginIn,
-    OwnerSetupIn,
     SessionOut,
     SetupStatusOut,
     UserOut,
@@ -75,21 +73,36 @@ async def start_session(
     )
 
 
-@router.get("/auth/csrf", response_model=CsrfOut, summary="Issue a CSRF token (and cookie)")
-async def csrf_token(ctx: Ctx, auth: OptionalAuth, response: Response) -> CsrfOut:
-    token = ctx.csrf.issue(str(auth.session.id) if auth else "anon")
+def ensure_csrf_token(request: Request, response: Response, ctx: AppContext, binding: str) -> str:
+    """Keep the browser's CSRF token while it is still valid for ``binding``.
+
+    Issuing a new value on every read would race with writes already in
+    flight (their header would no longer match the cookie). A new token is
+    minted only when there is none, or it belongs to another session.
+    """
+    current = request.cookies.get(ctx.csrf_cookie_name, "")
+    token = current if current and ctx.csrf.verify(current, binding) else ctx.csrf.issue(binding)
     set_csrf_cookie(response, ctx, token)
-    return CsrfOut(csrf_token=token)
+    return token
+
+
+@router.get("/auth/csrf", response_model=CsrfOut, summary="Issue a CSRF token (and cookie)")
+async def csrf_token(request: Request, ctx: Ctx, auth: OptionalAuth, response: Response) -> CsrfOut:
+    binding = str(auth.session.id) if auth else "anon"
+    return CsrfOut(csrf_token=ensure_csrf_token(request, response, ctx, binding))
 
 
 @router.get("/auth/session", response_model=SessionOut, summary="Current user/session")
-async def current_session(ctx: Ctx, auth: OptionalAuth, response: Response) -> SessionOut:
+async def current_session(
+    request: Request, ctx: Ctx, auth: OptionalAuth, response: Response
+) -> SessionOut:
     if auth is None:
-        token = ctx.csrf.issue("anon")
-        set_csrf_cookie(response, ctx, token)
-        return SessionOut(authenticated=False, csrf_token=token)
-    token = ctx.csrf.issue(str(auth.session.id))
-    set_csrf_cookie(response, ctx, token)
+        stale = request.cookies.get(ctx.session_cookie_name) is not None
+        if stale:
+            clear_session_cookie(response, ctx)
+        token = ensure_csrf_token(request, response, ctx, "anon")
+        return SessionOut(authenticated=False, csrf_token=token, session_expired=stale)
+    token = ensure_csrf_token(request, response, ctx, str(auth.session.id))
     return SessionOut(
         authenticated=True,
         user=user_out(auth.user, auth.membership),
@@ -126,31 +139,7 @@ async def logout(ctx: Ctx, db: Db, auth: OptionalAuth, response: Response) -> Se
 
 
 @router.get("/setup/status", response_model=SetupStatusOut, summary="Is the owner set up?")
-async def setup_status(ctx: Ctx, db: Db) -> SetupStatusOut:
-    exists = await accounts.owner_exists(db)
-    return SetupStatusOut(
-        owner_exists=exists,
-        web_bootstrap_enabled=ctx.settings.bootstrap_token is not None and not exists,
-    )
-
-
-@router.post(
-    "/setup/owner",
-    response_model=SessionOut,
-    status_code=201,
-    summary="One-time owner creation, only when BOOTSTRAP_TOKEN is configured",
-)
-async def setup_owner(
-    body: OwnerSetupIn, request: Request, response: Response, ctx: Ctx, db: Db
-) -> SessionOut:
-    configured = ctx.settings.bootstrap_token
-    if configured is None:
-        raise NotFound  # the endpoint does not exist unless explicitly enabled
-    ctx.rate_limiter.check(f"bootstrap:ip:{client_ip(request)}", BOOTSTRAP_PER_IP)
-    if not tokens_equal(body.bootstrap_token, configured.get_secret_value()):
-        raise AppError("Invalid bootstrap token.", code="invalid_bootstrap_token")
-    user = await accounts.create_owner(
-        db, ctx, username=body.username, display_name=body.display_name, password=body.password
-    )
-    response.status_code = 201
-    return await start_session(db, ctx, response, user)
+async def setup_status(db: Db) -> SetupStatusOut:
+    # The owner is created on the server with `python -m app.cli.bootstrap_owner`;
+    # the sign-in page uses this to explain a fresh, not-yet-initialised install.
+    return SetupStatusOut(owner_exists=await accounts.owner_exists(db))

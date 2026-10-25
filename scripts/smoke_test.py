@@ -52,6 +52,7 @@ def main() -> None:
     parser.add_argument("--backend", required=True)
     args = parser.parse_args()
     origin: str = args.origin
+    backend: str = args.backend
     owner_password = os.environ["SMOKE_OWNER_PASSWORD"]
 
     a = Browser(origin)  # the owner's browser
@@ -70,6 +71,19 @@ def main() -> None:
     check(
         "config: demo enabled, yandex disabled",
         config["providers"]["demo"]["available"] and not config["providers"]["yandex"]["available"],
+    )
+    direct = httpx.get(f"{backend}/api/v1/config", timeout=10)
+    check(
+        "API refuses requests that bypass the proxy (no proxy secret)",
+        direct.status_code == 403 and direct.json()["error"]["code"] == "proxy_required",
+    )
+    forged = httpx.get(
+        f"{backend}/api/v1/config", headers={"X-TwoOfUs-Proxy-Auth": "guessed"}, timeout=10
+    )
+    check("API refuses a guessed proxy secret", forged.status_code == 403)
+    check(
+        "setup status: the owner exists",
+        a.http.get("/api/v1/setup/status").json() == {"owner_exists": True},
     )
 
     refused = a.http.post(
@@ -93,6 +107,9 @@ def main() -> None:
 
     session = a.http.get("/api/v1/auth/session").json()
     check("session is authenticated", session["authenticated"] is True)
+
+    big = a.send("POST", "/api/v1/auth/login", content=b"x" * (70 * 1024))
+    check("oversized request body is refused (413)", big.status_code == 413)
 
     demo = a.send("POST", "/api/v1/providers/demo/connect")
     check("connect DEMO provider", demo.status_code == 200 and demo.json()["provider"] == "demo")
@@ -185,7 +202,7 @@ def main() -> None:
     check(
         "callback via proxy: other person's session is refused",
         hijack.status_code == 303
-        and hijack.headers["location"] == "/?connect=spotify&result=session_mismatch",
+        and hijack.headers["location"] == "/connect?connect=spotify&result=session_mismatch",
     )
     url = a.send("POST", "/api/v1/providers/spotify/authorize").json()["authorization_url"]
     state = parse_qs(urlsplit(url).query)["state"][0]
@@ -194,11 +211,12 @@ def main() -> None:
     )
     check(
         "callback via proxy: session cookie arrives, state accepted, denial reported",
-        denied.headers["location"] == "/?connect=spotify&result=access_denied",
+        denied.headers["location"] == "/connect?connect=spotify&result=access_denied",
     )
     landing = a.http.get(denied.headers["location"])
     check(
-        "redirect target page renders", landing.status_code == 200 and "Two of Us" in landing.text
+        "redirect target page renders",
+        landing.status_code == 200 and "JustTheTwoOfUs" in landing.text,
     )
 
     bodies = "".join(
@@ -229,7 +247,7 @@ def main() -> None:
     check("partner deletes own account", gone.status_code == 204)
     check("deleted account is signed out", b.http.get("/api/v1/me").status_code == 401)
 
-    # Informational: does a client-supplied X-Forwarded-For reach the rate limiter?
+    # A client-supplied X-Forwarded-For must not reach the per-IP rate limiter.
     probe = Browser(origin)
     for i in range(21):
         probe.send(
@@ -244,9 +262,11 @@ def main() -> None:
         json={"username": "nobody-x", "password": "wrong-password-x"},
         headers={"X-Forwarded-For": "203.0.113.8"},
     )
-    honoured = other.status_code == 401
-    verdict = "IS" if honoured else "is NOT"
-    print(f"INFO client-supplied X-Forwarded-For {verdict} used for per-IP rate limiting")
+    check(
+        "client-supplied X-Forwarded-For is ignored by the per-IP rate limit",
+        other.status_code == 429,
+        f"(got {other.status_code})",
+    )
 
     print(f"\nSmoke test passed: {len(RESULTS)} checks.")
 

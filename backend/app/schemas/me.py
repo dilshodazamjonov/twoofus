@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
 from pydantic import Field
@@ -30,3 +31,19 @@ class SharingOut(OutModel):
 
 class DeleteAccountIn(ApiModel):
     password: str = Field(min_length=1, max_length=256)
+
+
+class SessionInfoOut(OutModel):
+    id: uuid.UUID
+    created_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    current: bool = Field(description="The session making this request.")
+
+
+class SessionsOut(OutModel):
+    sessions: list[SessionInfoOut] = Field(description="Most recently used first.")
+
+
+class RevokedOut(OutModel):
+    revoked: int

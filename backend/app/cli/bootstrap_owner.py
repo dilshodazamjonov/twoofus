@@ -15,7 +15,7 @@ import sys
 
 from sqlalchemy import text
 
-from app.core.config import get_settings
+from app.core.config import ConfigError, get_settings
 from app.core.errors import AppError
 from app.main import build_context, close_context
 from app.migrations_info import expected_head
@@ -52,6 +52,11 @@ def main(argv: list[str] | None = None) -> int:
         help="read the password from stdin instead of prompting (for scripts)",
     )
     args = parser.parse_args(argv)
+    try:
+        get_settings()  # fail before asking for anything if .env is invalid
+    except ConfigError as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
     username = args.username or input("Username: ").strip()
     display_name = args.display_name or input("Display name: ").strip()

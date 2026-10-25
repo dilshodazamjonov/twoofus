@@ -1,0 +1,151 @@
+# JustTheTwoOfUs production stack: one small server, one public HTTPS origin.
+# Step-by-step guide: docs/DEPLOYMENT.md. Run from this directory:
+#   docker compose up -d --build
+#
+#   browser ──https──> caddy ─┬─ /api/* ──> api (FastAPI, 1 worker) ──> db (PostgreSQL)
+#                             └─ else ────> web (Next.js)               └──> Spotify / Yandex
+#
+# * Only Caddy publishes ports. The API adds/answers nothing without the
+#   proxy secret Caddy attaches, and has no route from the internet otherwise.
+# * The database network is internal (no internet); only the API gets egress.
+# * Secrets are files under $TWOOFUS_SECRETS_DIR (decrypted into RAM by the
+#   systemd unit in systemd/, from systemd-creds encrypted storage), mounted
+#   read-only at /run/secrets. They never appear in images, env or logs.
+
+name: twoofus
+
+x-hardened: &hardened
+  # on-failure: Docker never starts these at boot on its own, before the
+  # systemd unit has put the decrypted secrets in place (it starts the stack).
+  restart: ${TWOOFUS_RESTART:-on-failure}
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+
+services:
+  caddy:
+    <<: *hardened
+    image: caddy:2.11-alpine
+    cap_add: ["NET_BIND_SERVICE"]
+    ports:
+      - "${TWOOFUS_HTTP_PORT:-80}:80"
+      - "${TWOOFUS_HTTPS_PORT:-443}:443"
+      - "${TWOOFUS_HTTPS_PORT:-443}:443/udp"
+    environment:
+      TWOOFUS_DOMAIN: ${TWOOFUS_DOMAIN:?set TWOOFUS_DOMAIN in deploy/.env}
+      TWOOFUS_TLS: ${TWOOFUS_TLS:?set TWOOFUS_TLS in deploy/.env (your e-mail for Let's Encrypt)}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs: ["/tmp"]
+    secrets: [proxy_shared_secret]
+    networks:
+      public: {}
+      app: { ipv4_address: 172.31.250.10 }
+    depends_on:
+      web: { condition: service_healthy }
+      api: { condition: service_healthy }
+    mem_limit: 128m
+    pids_limit: 128
+
+  web:
+    <<: *hardened
+    build:
+      context: ../frontend
+      args: { APP_BUILD_ID: "${TWOOFUS_VERSION:-local}" }
+    image: twoofus-web:${TWOOFUS_VERSION:-local}
+    environment:
+      BACKEND_INTERNAL_URL: http://api:8000
+    group_add: ["10001"]
+    tmpfs: ["/tmp", "/app/.next/cache"]
+    secrets: [proxy_shared_secret]
+    networks: [app]
+    mem_limit: 384m
+    cpus: 1.0
+    pids_limit: 256
+
+  api:
+    <<: *hardened
+    build: ../backend
+    image: twoofus-api:${TWOOFUS_VERSION:-local}
+    environment:
+      ENVIRONMENT: production
+      APP_NAME: ${APP_NAME:-JustTheTwoOfUs}
+      PUBLIC_APP_URL: https://${TWOOFUS_DOMAIN}${TWOOFUS_PUBLIC_PORT_SUFFIX:-}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_REDIRECT_URI: https://${TWOOFUS_DOMAIN}${TWOOFUS_PUBLIC_PORT_SUFFIX:-}/api/v1/providers/spotify/callback
+      YANDEX_ENABLED: ${YANDEX_ENABLED:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Trust X-Forwarded-For only from Caddy's fixed address on the app network.
+      FORWARDED_ALLOW_IPS: 172.31.250.10
+    tmpfs: ["/tmp"]
+    secrets: [secret_key, token_encryption_keys, proxy_shared_secret, database_url]
+    networks: [app, egress, db]
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    mem_limit: 384m
+    cpus: 1.0
+    pids_limit: 256
+
+  # Release step: apply database migrations, then exit. `api` waits for it.
+  migrate:
+    <<: *hardened
+    image: twoofus-api:${TWOOFUS_VERSION:-local}
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    secrets: [database_url]
+    networks: [db]
+    depends_on:
+      db: { condition: service_healthy }
+
+  db:
+    image: postgres:18-alpine
+    restart: ${TWOOFUS_RESTART:-on-failure}
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_DB: twoofus
+      POSTGRES_USER: twoofus
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    group_add: ["10001"]
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql
+    networks: [db]
+    shm_size: 128m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twoofus -d twoofus"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+    mem_limit: 512m
+    pids_limit: 256
+
+networks:
+  public: {}
+  app:
+    internal: true
+    ipam:
+      config: [{ subnet: 172.31.250.0/24 }]
+  egress: {}
+  db:
+    internal: true
+
+volumes:
+  pgdata: {}
+  caddy_data: {}
+  caddy_config: {}
+
+secrets:
+  secret_key: { file: "${TWOOFUS_SECRETS_DIR:?set TWOOFUS_SECRETS_DIR}/secret_key" }
+  token_encryption_keys: { file: "${TWOOFUS_SECRETS_DIR}/token_encryption_keys" }
+  proxy_shared_secret: { file: "${TWOOFUS_SECRETS_DIR}/proxy_shared_secret" }
+  database_url: { file: "${TWOOFUS_SECRETS_DIR}/database_url" }
+  postgres_password: { file: "${TWOOFUS_SECRETS_DIR}/postgres_password" }

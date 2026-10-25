@@ -8,12 +8,22 @@ cd "$ROOT"
 # shellcheck source=scripts/env.sh
 source scripts/env.sh
 export NEXT_TELEMETRY_DISABLED=1
+# Job control: every background server gets its own process group, so cleanup
+# can stop the whole tree (the npm/npx/uv wrapper *and* the server it spawned).
+set -m
+port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+for port in 8000 3000; do
+  if port_busy "$port"; then
+    echo "Port $port is already in use. Stop that process first (another dev server?)." >&2
+    exit 1
+  fi
+done
 
 (cd backend && uv run alembic upgrade head)
 
 pids=()
 cleanup() {
-  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
 }
 trap cleanup INT TERM EXIT

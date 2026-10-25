@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- JustTheTwoOfUs app icon: a tulip. Rendered to PNG by scripts/generate-icons.mjs.
+       Everything sits inside the central 80% circle, so it also works as a maskable icon. -->
+  <rect width="512" height="512" fill="#FFF9F5"/>
+  <circle cx="256" cy="256" r="236" fill="#F6DADD" opacity="0.55"/>
+  <g transform="translate(64 64) scale(16)" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 13.5V22" stroke="#5E7D5A"/>
+    <path d="M12 22c0-3 2.2-5.2 5.5-5.2 0 3-2.4 5.2-5.5 5.2Z" stroke="#5E7D5A" fill="#B7C9B5"/>
+    <path d="M12 19.5c-.6-2.1-2.2-3.4-4.5-3.6" stroke="#5E7D5A"/>
+    <path d="M12 13.5c2.8 0 5-2.2 5-5V3.5l-2.6 2.2L12 2.5 9.6 5.7 7 3.5v5c0 2.8 2.2 5 5 5Z" stroke="#813F59" fill="#813F59"/>
+  </g>
+</svg>

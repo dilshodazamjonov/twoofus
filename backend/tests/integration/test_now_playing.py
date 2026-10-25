@@ -169,7 +169,7 @@ async def spotify_conn(ctx: AppContext, owner: Any) -> ConnectionRef:
     from app.services.provider_auth import store_connection
 
     async with ctx.session_factory() as db:
-        conn = await store_connection(
+        conn, _ = await store_connection(
             db,
             ctx,
             user_id=owner.id,

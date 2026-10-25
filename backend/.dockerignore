@@ -1,0 +1,9 @@
+# Only what backend/Dockerfile copies is needed; never send secrets or data.
+*
+!pyproject.toml
+!uv.lock
+!app/
+!alembic/
+!alembic.ini
+**/__pycache__
+**/*.pyc

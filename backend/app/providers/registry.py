@@ -51,6 +51,7 @@ def build_registry(
             client_id=settings.spotify_client_id,
             redirect_uri=settings.spotify_redirect_uri,
             clock=clock,
+            upstream_override=settings.upstream_override,
         )
         if settings.spotify_configured
         else None
@@ -58,7 +59,11 @@ def build_registry(
     yandex = (
         YandexProvider(
             yandex_gateway
-            or LibraryYandexGateway(timeout_seconds=settings.provider_timeout_seconds),
+            or LibraryYandexGateway(
+                timeout_seconds=settings.provider_timeout_seconds,
+                http=http,
+                upstream_override=settings.upstream_override,
+            ),
             app_name=settings.app_name,
             web_base=settings.yandex_music_web_base,
             clock=clock,

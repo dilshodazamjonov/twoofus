@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from pydantic_settings import SettingsConfigDict
 
 from app.auth.passwords import Passwords, password_problem
+from app.core.config import Settings
 from app.core.crypto import DecryptionError, TokenCipher, generate_key
 from app.core.errors import RateLimited
 from app.core.logging import RedactingFilter, redact
@@ -123,24 +126,31 @@ def test_spotify_client_id_requires_redirect() -> None:
         make_settings("sqlite+aiosqlite:///x.db", spotify_redirect_uri="")
 
 
+PRODUCTION = {
+    "environment": "production",
+    "public_app_url": "https://twoofus.example.net",
+    "spotify_redirect_uri": "https://twoofus.example.net/api/v1/providers/spotify/callback",
+    "demo_mode": False,
+    "proxy_shared_secret": "p" * 16 + "R4nd0m-proxy-secret-value",
+}
+
+
 def test_production_requires_https_and_secure_cookies() -> None:
     with pytest.raises(ValidationError, match="https"):
-        make_settings("sqlite+aiosqlite:///x.db", environment="production")
-    prod = make_settings(
-        "sqlite+aiosqlite:///x.db",
-        environment="production",
-        public_app_url="https://twoofus.example.net",
-        spotify_redirect_uri="https://twoofus.example.net/api/v1/providers/spotify/callback",
-    )
+        make_settings("sqlite+aiosqlite:///x.db", environment="production", demo_mode=False)
+    prod = make_settings("sqlite+aiosqlite:///x.db", **PRODUCTION)
     assert prod.secure_cookies is True
+    assert prod.demo_controls_enabled is False
     with pytest.raises(ValidationError, match="COOKIE_SECURE"):
-        make_settings(
-            "sqlite+aiosqlite:///x.db",
-            environment="production",
-            public_app_url="https://twoofus.example.net",
-            spotify_redirect_uri="https://twoofus.example.net/api/v1/providers/spotify/callback",
-            cookie_secure=False,
-        )
+        make_settings("sqlite+aiosqlite:///x.db", **{**PRODUCTION, "cookie_secure": False})
+
+
+def test_production_refuses_demo_mode() -> None:
+    # Invented songs must never be shown as real in a deployment.
+    with pytest.raises(ValidationError, match="DEMO_MODE must be false in production"):
+        make_settings("sqlite+aiosqlite:///x.db", **{**PRODUCTION, "demo_mode": True})
+    development = make_settings("sqlite+aiosqlite:///x.db", demo_mode=True)
+    assert development.demo_controls_enabled is True
 
 
 def test_database_url_normalisation_and_derived_values() -> None:
@@ -155,10 +165,58 @@ def test_database_url_normalisation_and_derived_values() -> None:
     assert local.allowed_origins == {"http://127.0.0.1:3000", "https://other.example"}
 
 
-def test_bootstrap_token_validation() -> None:
-    assert make_settings("sqlite+aiosqlite:///x.db", bootstrap_token="").bootstrap_token is None
-    with pytest.raises(ValidationError, match="BOOTSTRAP_TOKEN"):
-        make_settings("sqlite+aiosqlite:///x.db", bootstrap_token="too-short")
+def test_proxy_secret_validation_and_production_requirements() -> None:
+    url = "sqlite+aiosqlite:///x.db"
+    assert make_settings(url, proxy_shared_secret="").proxy_shared_secret is None
+    with pytest.raises(ValidationError, match="PROXY_SHARED_SECRET"):
+        make_settings(url, proxy_shared_secret="too-short")
+    with pytest.raises(ValidationError, match="PROXY_SHARED_SECRET"):
+        make_settings(url, proxy_shared_secret="CHANGE_ME" + "x" * 40)
+    with pytest.raises(ValidationError, match="PROXY_SHARED_SECRET is required in production"):
+        make_settings(url, **{**PRODUCTION, "proxy_shared_secret": ""})
+    with pytest.raises(ValidationError, match="LOG_LEVEL=DEBUG"):
+        make_settings(url, **{**PRODUCTION, "log_level": "DEBUG"})
+    prod = make_settings(url, **PRODUCTION)
+    assert prod.log_format == "json"
+    assert make_settings(url).log_format == "text"
+    assert make_settings(url, **{**PRODUCTION, "log_format": "text"}).log_format == "text"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://127.0.0.1:8300",
+        "http://example.com:8300",
+        "http://10.0.0.5:8300",
+        "http://127.0.0.1",
+        "http://127.0.0.1:8300/path",
+        "http://user:pw@127.0.0.1:8300",
+        "http://127.0.0.1:8300?x=1",
+    ],
+)
+def test_upstream_override_accepts_local_fakes_only(value: str) -> None:
+    with pytest.raises(ValidationError, match="PROVIDER_UPSTREAM_OVERRIDE"):
+        make_settings("sqlite+aiosqlite:///x.db", provider_upstream_override=value)
+
+
+def test_upstream_override_is_refused_in_production() -> None:
+    url = "sqlite+aiosqlite:///x.db"
+    local = make_settings(url, provider_upstream_override="http://127.0.0.1:8300/")
+    assert local.upstream_override == "http://127.0.0.1:8300"
+    assert make_settings(url).upstream_override is None
+    with pytest.raises(ValidationError, match="PROVIDER_UPSTREAM_OVERRIDE is for local tests"):
+        make_settings(url, **{**PRODUCTION, "provider_upstream_override": "http://127.0.0.1:8300"})
+
+
+def test_secrets_can_come_from_files(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Docker secrets / systemd credentials: one file per value, named after the setting.
+    (tmp_path / "secret_key").write_text("f" * 8 + "ile-based-secret-key-value-123456\n")
+    (tmp_path / "token_encryption_keys").write_text(generate_key())
+    settings = Settings(_env_file=None, _secrets_dir=tmp_path)  # type: ignore[call-arg]
+    assert settings.secret_key.get_secret_value() == "f" * 8 + "ile-based-secret-key-value-123456"
+    monkeypatch.setenv("SECRET_KEY", "e" * 8 + "nv-wins-over-files-secret-value-1234")
+    from_env = Settings(_env_file=None, _secrets_dir=tmp_path)  # type: ignore[call-arg]
+    assert from_env.secret_key.get_secret_value().startswith("eeeeeeee")
 
 
 # ----- passwords --------------------------------------------------------------------
@@ -183,6 +241,17 @@ def test_password_policy() -> None:
 
 
 # ----- rate limiting ----------------------------------------------------------------
+
+
+def test_rate_limiter_forgets_idle_keys_within_a_day() -> None:
+    # Keys contain client IP addresses: they must not linger in memory.
+    now = [0.0]
+    limiter = RateLimiter(monotonic=lambda: now[0])
+    limiter.check("login:ip:203.0.113.7", Limit(attempts=5, window_seconds=900))
+    assert limiter.tracked_keys() == 1
+    now[0] += 24 * 3600 + 601
+    limiter.check("login:ip:198.51.100.1", Limit(attempts=5, window_seconds=900))
+    assert limiter.tracked_keys() == 1  # the idle key is gone, only the new one remains
 
 
 def test_rate_limiter_window() -> None:
@@ -248,3 +317,49 @@ def test_redacting_filter_scrubs_records_and_tracebacks() -> None:
     RedactingFilter().filter(record)
     assert record.exc_text is not None
     assert "LEAKED" not in record.exc_text
+
+
+# ----- readable configuration errors ---------------------------------------------------
+
+
+def test_config_errors_are_readable_and_never_echo_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.core.config import describe_validation_error
+
+    secret = "do-not-print-me-" + "q" * 40
+    with pytest.raises(ValidationError) as excinfo:
+        make_settings("sqlite+aiosqlite:///x.db", secret_key=secret, spotify_redirect_uri="")
+    assert secret not in str(excinfo.value)  # hide_input_in_errors
+    assert describe_validation_error(excinfo.value) == (
+        "Invalid configuration (backend/.env or environment variables):\n"
+        "  - SPOTIFY_REDIRECT_URI is required when SPOTIFY_CLIENT_ID is set"
+    )
+
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    with pytest.raises(ValidationError) as missing:
+        Settings(_env_file=None, token_encryption_keys=generate_key())  # type: ignore[call-arg]
+    assert "  - SECRET_KEY: Field required" in describe_validation_error(missing.value)
+
+
+def test_get_settings_raises_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.core import config
+
+    class IsolatedSettings(config.Settings):
+        # Same settings class, but never reads the developer's backend/.env.
+        model_config = SettingsConfigDict({**config.Settings.model_config, "env_file": None})
+
+    secret = "s" * 48
+    monkeypatch.setattr(config, "Settings", IsolatedSettings)
+    monkeypatch.setenv("SECRET_KEY", secret)
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEYS", generate_key())
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "0123456789abcdef0123456789abcdef")
+    monkeypatch.setenv("SPOTIFY_REDIRECT_URI", "")
+    config.get_settings.cache_clear()
+    try:
+        with pytest.raises(config.ConfigError) as excinfo:
+            config.get_settings()
+    finally:
+        config.get_settings.cache_clear()
+    message = str(excinfo.value)
+    assert "SPOTIFY_REDIRECT_URI is required" in message
+    assert secret not in message
+    assert excinfo.value.__cause__ is None  # no chained pydantic traceback

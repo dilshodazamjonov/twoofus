@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from app.auth.passwords import password_problem
 from app.auth.sessions import revoke_all_sessions
-from app.core.config import get_settings
+from app.core.config import ConfigError, get_settings
 from app.main import build_context, close_context
 from app.models import User
 from app.services.accounts import normalize_username
@@ -49,6 +49,11 @@ def main(argv: list[str] | None = None) -> int:
         "--password-stdin", action="store_true", help="read the password from stdin"
     )
     args = parser.parse_args(argv)
+    try:
+        get_settings()  # fail before asking for anything if .env is invalid
+    except ConfigError as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
     if args.password_stdin:
         password = sys.stdin.readline().rstrip("\r\n")

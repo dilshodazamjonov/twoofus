@@ -1,0 +1,34 @@
+# JustTheTwoOfUs: starts the Docker Compose stack with secrets decrypted from
+# systemd-creds storage into RAM for as long as the stack runs.
+# Install (docs/DEPLOYMENT.md): copy to /etc/systemd/system/, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now twoofus
+[Unit]
+Description=JustTheTwoOfUs (Docker Compose stack)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/twoofus/deploy
+Environment=TWOOFUS_SECRETS_DIR=/run/twoofus/secrets
+# /run/twoofus is tmpfs (RAM) and is removed when the service stops.
+RuntimeDirectory=twoofus
+RuntimeDirectoryMode=0750
+LoadCredentialEncrypted=secret_key:/etc/credstore.encrypted/twoofus-secret_key
+LoadCredentialEncrypted=token_encryption_keys:/etc/credstore.encrypted/twoofus-token_encryption_keys
+LoadCredentialEncrypted=proxy_shared_secret:/etc/credstore.encrypted/twoofus-proxy_shared_secret
+LoadCredentialEncrypted=postgres_password:/etc/credstore.encrypted/twoofus-postgres_password
+LoadCredentialEncrypted=database_url:/etc/credstore.encrypted/twoofus-database_url
+# Containers left over from an unclean shutdown would point at secrets that no
+# longer exist: remove them first, then put this boot's secrets in place.
+ExecStartPre=-/usr/bin/docker compose down --remove-orphans
+ExecStartPre=/opt/twoofus/deploy/scripts/secrets.sh stage /run/twoofus/secrets
+ExecStart=/usr/bin/docker compose up --no-build --remove-orphans
+ExecStop=/usr/bin/docker compose down
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=multi-user.target

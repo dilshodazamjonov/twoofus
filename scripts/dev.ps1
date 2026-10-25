@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Two of Us - native Windows helper (PowerShell 5.1+ or 7+).
+  JustTheTwoOfUs - native Windows helper (PowerShell 5.1+ or 7+).
 
 .DESCRIPTION
   For a checkout on the Windows filesystem, using Windows-native Node.js and uv.

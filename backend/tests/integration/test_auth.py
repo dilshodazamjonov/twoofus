@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import timedelta
 from typing import Any
 
 import pytest
 from sqlalchemy import func, select
 
+from app.auth import sessions
+from app.auth.sessions import ROTATION_GRACE
 from app.context import AppContext
+from app.core.security import hash_token
 from app.models import AuthSession
 from tests.conftest import OWNER_PASSWORD, ApiClient, FakeClock
 
@@ -160,7 +165,7 @@ async def test_login_issues_a_new_session_each_time(
     assert replay.status_code == 401  # previous session revoked (no fixation)
 
 
-async def test_session_rotation_and_idle_expiry(
+async def test_session_rotation_grace_and_idle_expiry(
     owner_client: ApiClient, clock: FakeClock, make_client: Any
 ) -> None:
     original = owner_client.http.cookies.get("twoofus_session") or ""
@@ -170,11 +175,54 @@ async def test_session_rotation_and_idle_expiry(
     rotated = owner_client.http.cookies.get("twoofus_session")
     assert rotated
     assert rotated != original
-    stale = await replayer(make_client, twoofus_session=original).get("/api/v1/me")
-    assert stale.status_code == 401
+
+    # A request already in flight with the old cookie still succeeds, without
+    # rotating again (only one response may hand out the new token)...
+    in_flight = replayer(make_client, twoofus_session=original)
+    late = await in_flight.get("/api/v1/me")
+    assert late.status_code == 200
+    assert "twoofus_session" not in late.cookies
+    # ...but only during the short grace period.
+    clock.advance(seconds=ROTATION_GRACE.total_seconds() + 1)
+    assert (await in_flight.get("/api/v1/me")).status_code == 401
+    assert (await owner_client.get("/api/v1/me")).status_code == 200
 
     clock.advance(days=15)  # idle longer than SESSION_IDLE_DAYS
     assert (await owner_client.get("/api/v1/me")).status_code == 401
+
+
+async def test_simultaneous_requests_rotate_the_token_once(
+    owner_client: ApiClient, clock: FakeClock, make_client: Any
+) -> None:
+    original = owner_client.http.cookies.get("twoofus_session") or ""
+    clock.advance(hours=25)
+    first, second = (replayer(make_client, twoofus_session=original) for _ in range(2))
+    responses = await asyncio.gather(first.get("/api/v1/me"), second.get("/api/v1/me"))
+    assert [r.status_code for r in responses] == [200, 200]
+    issued = [r.cookies["twoofus_session"] for r in responses if "twoofus_session" in r.cookies]
+    assert len(issued) == 1
+    winner = replayer(make_client, twoofus_session=issued[0])
+    assert (await winner.get("/api/v1/me")).status_code == 200
+
+
+async def test_rotation_race_has_a_single_winner(owner_client: ApiClient, ctx: AppContext) -> None:
+    # Two requests that loaded the session before either rotated it: the
+    # conditional UPDATE lets only the first one swap the token.
+    presented = hash_token(owner_client.http.cookies.get("twoofus_session") or "")
+    now = ctx.clock() + timedelta(hours=25)
+    async with ctx.session_factory() as db_a, ctx.session_factory() as db_b:
+        row_a = (await db_a.execute(select(AuthSession))).scalar_one()
+        row_b = (await db_b.execute(select(AuthSession))).scalar_one()
+        token_a = await sessions._rotate(db_a, row_a, presented, now)
+        await db_a.commit()
+        token_b = await sessions._rotate(db_b, row_b, presented, now)
+        await db_b.commit()
+    assert token_a is not None
+    assert token_b is None
+    async with ctx.session_factory() as db:
+        stored = (await db.execute(select(AuthSession))).scalar_one()
+    assert stored.token_hash == hash_token(token_a)
+    assert stored.previous_token_hash == presented
 
 
 async def test_absolute_expiry(owner_client: ApiClient, clock: FakeClock) -> None:
@@ -206,19 +254,30 @@ async def test_validation_errors_do_not_echo_input(make_client: Any) -> None:
 # ----- owner bootstrap ------------------------------------------------------------------
 
 
-async def test_setup_status_and_disabled_web_bootstrap(make_client: Any) -> None:
+async def test_setup_status_and_no_web_bootstrap(make_client: Any) -> None:
     client: ApiClient = make_client()
-    assert (await client.get("/api/v1/setup/status")).json() == {
-        "owner_exists": True,
-        "web_bootstrap_enabled": False,
-    }
+    assert (await client.get("/api/v1/setup/status")).json() == {"owner_exists": True}
+    # Owners are created on the server (CLI) only; there is no web endpoint for it.
     response = await client.post(
         "/api/v1/setup/owner",
-        json={
-            "bootstrap_token": "x" * 40,
-            "username": "eve",
-            "display_name": "Eve",
-            "password": "long-password-1",
-        },
+        json={"username": "eve", "display_name": "Eve", "password": "long-password-1"},
     )
     assert response.status_code == 404
+
+
+async def test_csrf_token_is_kept_while_valid(make_client: Any) -> None:
+    # Re-reading the session must not churn the token (writes in flight would break).
+    client: ApiClient = make_client()
+    first = (await client.get("/api/v1/auth/session")).json()["csrf_token"]
+    assert (await client.get("/api/v1/auth/session")).json()["csrf_token"] == first
+    assert (await client.get("/api/v1/auth/csrf")).json()["csrf_token"] == first
+
+    signed_in = (await client.login("khaled", OWNER_PASSWORD)).json()["csrf_token"]
+    assert signed_in != first  # new binding after login
+    assert (await client.get("/api/v1/auth/session")).json()["csrf_token"] == signed_in
+    assert client.http.cookies.get("twoofus_csrf") == signed_in
+
+    # A token planted for another binding is replaced, never reused.
+    client.http.cookies.set("twoofus_csrf", first)
+    replaced = (await client.get("/api/v1/auth/session")).json()["csrf_token"]
+    assert replaced not in {first, signed_in}

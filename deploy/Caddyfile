@@ -1,0 +1,53 @@
+# The single public HTTPS origin (deploy/compose.yaml, docs/DEPLOYMENT.md).
+# Certificates: automatic from Let's Encrypt for TWOOFUS_DOMAIN, using the
+# e-mail in TWOOFUS_TLS. (Local test runs set TWOOFUS_TLS=internal.)
+{
+	# Caddy's own messages (errors, certificates). No access log on purpose:
+	# OAuth callbacks carry one-time codes in their query strings.
+	log {
+		output stderr
+		format json
+		level WARN
+	}
+	# No trusted_proxies: Caddy is the edge, so it replaces any client-sent
+	# X-Forwarded-For with the real peer address before proxying.
+
+	# Clients send no SNI for IP addresses (a local test with TWOOFUS_TLS=internal);
+	# real domains always do, so this changes nothing for them.
+	default_sni {$TWOOFUS_DOMAIN}
+	# Never touch the container's (read-only) system trust store.
+	skip_install_trust
+}
+
+{$TWOOFUS_DOMAIN} {
+	tls {$TWOOFUS_TLS}
+
+	# The largest legitimate request body is well under 1 KiB.
+	request_body {
+		max_size 64KB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		-Server
+		-Via
+	}
+
+	handle /api/* {
+		reverse_proxy api:8000 {
+			# Proves to FastAPI that this request came through the proxy.
+			header_up X-TwoOfUs-Proxy-Auth {file./run/secrets/proxy_shared_secret}
+			header_up X-Request-ID {http.request.uuid}
+		}
+	}
+
+	handle {
+		# Pages and static files. API responses are not compressed (tiny, and
+		# no secrets ever share a compressed response with attacker input).
+		encode zstd gzip
+		reverse_proxy web:3000 {
+			header_up X-Request-ID {http.request.uuid}
+		}
+	}
+}

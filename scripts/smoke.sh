@@ -23,15 +23,27 @@ BACK_PORT=8100
 FRONT_PORT=3100
 ORIGIN="http://127.0.0.1:${FRONT_PORT}"
 PY="$ROOT/backend/.venv/bin/python"
+# Job control: every background server gets its own process group, so cleanup
+# can stop the whole tree (the npm/npx/uv wrapper *and* the server it spawned).
+set -m
+port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+for port in "$BACK_PORT" "$FRONT_PORT"; do
+  if port_busy "$port"; then
+    echo "Port $port is already in use (a leftover server?). Stop it first." >&2
+    exit 1
+  fi
+done
 rm -rf "$WORK" && mkdir -p "$WORK"
 
 export TWOOFUS_ENV_FILE=""  # ignore backend/.env entirely
-export ENVIRONMENT=development LOG_LEVEL=INFO APP_NAME="Two of Us"
+export ENVIRONMENT=development LOG_LEVEL=INFO APP_NAME="JustTheTwoOfUs"
 export PUBLIC_APP_URL="$ORIGIN"
 export DATABASE_URL="sqlite+aiosqlite:///${WORK}/smoke.db"
 export SECRET_KEY="$("$PY" -c 'import secrets; print(secrets.token_urlsafe(48))')"
 export TOKEN_ENCRYPTION_KEYS="$(cd backend && "$PY" -c 'from app.core.crypto import generate_key; print(generate_key())')"
-export DEMO_MODE=true YANDEX_ENABLED=false BOOTSTRAP_TOKEN=""
+export DEMO_MODE=true YANDEX_ENABLED=false
+# The API accepts only requests that carry this (added by the Next.js proxy).
+export PROXY_SHARED_SECRET="$("$PY" -c 'import secrets; print(secrets.token_urlsafe(32))')"
 export SPOTIFY_CLIENT_ID="smoke-test-placeholder-not-a-real-client-id"
 export SPOTIFY_REDIRECT_URI="${ORIGIN}/api/v1/providers/spotify/callback"
 export NEXT_TELEMETRY_DISABLED=1
@@ -40,7 +52,7 @@ export SMOKE_OWNER_PASSWORD="$("$PY" -c 'import secrets; print(secrets.token_url
 pids=()
 cleanup() {
   local code=$?
-  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
   rm -rf "$ROOT/frontend/.next-smoke"
   if [[ $code -eq 0 && $keep -eq 0 ]]; then
@@ -72,21 +84,21 @@ echo "==> backend on 127.0.0.1:${BACK_PORT}"
 (cd backend && exec uv run --frozen uvicorn app.main:app --host 127.0.0.1 --port "$BACK_PORT" \
   --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-access-log >"$WORK/backend.log" 2>&1) &
 pids+=($!)
-wait_for "http://127.0.0.1:${BACK_PORT}/api/v1/health"
+wait_for "http://127.0.0.1:${BACK_PORT}/api/v1/health"  # liveness needs no proxy secret
 
 echo "==> frontend production build (proxy -> :${BACK_PORT}) and next start on :${FRONT_PORT}"
-(cd frontend && NEXT_DIST_DIR=.next-smoke BACKEND_INTERNAL_URL="http://127.0.0.1:${BACK_PORT}" \
+(cd frontend && NEXT_DIST_DIR=.next-smoke BACKEND_INTERNAL_URL="http://127.0.0.1:${BACK_PORT}" TWOOFUS_DEMO_UI=1 \
   npm run build >"$WORK/frontend-build.log" 2>&1)
-(cd frontend && NEXT_DIST_DIR=.next-smoke exec npx next start --hostname 127.0.0.1 --port "$FRONT_PORT" \
-  >"$WORK/frontend.log" 2>&1) &
+(cd frontend && NEXT_DIST_DIR=.next-smoke TWOOFUS_PROXY_SECRET="$PROXY_SHARED_SECRET" \
+  exec npx next start --hostname 127.0.0.1 --port "$FRONT_PORT" >"$WORK/frontend.log" 2>&1) &
 pids+=($!)
 wait_for "${ORIGIN}/api/v1/health"
 
 echo "==> authenticated flow through the proxy"
 "$PY" scripts/smoke_test.py --origin "$ORIGIN" --backend "http://127.0.0.1:${BACK_PORT}"
 
-if grep -E -q "auth-code|state=|code=|${SMOKE_OWNER_PASSWORD}" "$WORK/backend.log"; then
+if grep -E -q "auth-code|state=|code=|${SMOKE_OWNER_PASSWORD}|${PROXY_SHARED_SECRET}" "$WORK/backend.log" "$WORK/frontend.log"; then
   echo "FAIL backend log contains a secret-looking value" >&2
   exit 1
 fi
-echo "PASS backend log contains no OAuth codes, state values or passwords"
+echo "PASS logs contain no OAuth codes, state values, passwords or the proxy secret"

@@ -4,6 +4,11 @@ Everything here is invented and every response is flagged ``is_demo`` by the
 service layer, so demo playback can never be mistaken for a real service.
 The playlist loops on a fixed timeline that also exercises paused and idle
 states; the phase depends on the subject key so the two members differ.
+
+For UI work a connection can be pinned to a *scenario* (development only, see
+``PUT /providers/demo/scenario``). Error scenarios raise the same
+:class:`ProviderError` codes as the real adapters, so the real backoff, stale
+and re-authorisation paths run.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from app.providers.base import (
     Credentials,
     FetchResult,
     PlaybackStatus,
+    ProviderError,
     ProviderPlayback,
     TrackInfo,
 )
@@ -98,15 +104,7 @@ def demo_playback_at(moment: datetime, subject_key: str) -> ProviderPlayback:
         return ProviderPlayback(PlaybackStatus.IDLE, detail_code="nothing_playing")
 
     demo = DEMO_TRACKS[segment.track]
-    track = TrackInfo(
-        title=demo.title,
-        artist_names=demo.artists,
-        album=demo.album,
-        artwork_url=demo.artwork,
-        track_url=None,  # there is no real service to link to
-        duration_ms=demo.duration_ms,
-        provider_track_id=f"demo-{segment.track}",
-    )
+    track = _track(segment.track)  # no track_url: there is no real service to link to
     if segment.kind == "pause":
         return ProviderPlayback(
             PlaybackStatus.PAUSED,
@@ -122,13 +120,95 @@ def demo_playback_at(moment: datetime, subject_key: str) -> ProviderPlayback:
     )
 
 
+DemoScenario = Literal[
+    "live",
+    "playing",
+    "paused",
+    "idle",
+    "non_music",
+    "private_session",
+    "rate_limited",
+    "unreachable",
+    "forbidden",
+    "reauth_required",
+]
+DEMO_SCENARIOS: tuple[DemoScenario, ...] = (
+    "live",
+    "playing",
+    "paused",
+    "idle",
+    "non_music",
+    "private_session",
+    "rate_limited",
+    "unreachable",
+    "forbidden",
+    "reauth_required",
+)
+
+
+def _track(index: int) -> TrackInfo:
+    demo = DEMO_TRACKS[index]
+    return TrackInfo(
+        title=demo.title,
+        artist_names=demo.artists,
+        album=demo.album,
+        artwork_url=demo.artwork,
+        track_url=None,
+        duration_ms=demo.duration_ms,
+        provider_track_id=f"demo-{index}",
+    )
+
+
+def scenario_playback(scenario: str, moment: datetime, subject_key: str) -> ProviderPlayback:
+    """Playback for a pinned scenario; error scenarios raise like real adapters."""
+    match scenario:
+        case "playing":
+            track = _track(0)
+            progress = int(moment.timestamp() * 1000) % DEMO_TRACKS[0].duration_ms
+            return ProviderPlayback(
+                PlaybackStatus.PLAYING, ContentType.TRACK, track, progress_ms=progress
+            )
+        case "paused":
+            return ProviderPlayback(PlaybackStatus.PAUSED, ContentType.TRACK, _track(1), 80_000)
+        case "idle":
+            return ProviderPlayback(PlaybackStatus.IDLE, detail_code="nothing_playing")
+        case "non_music":
+            return ProviderPlayback(
+                PlaybackStatus.PLAYING, ContentType.EPISODE, detail_code="non_music_content"
+            )
+        case "private_session":
+            return ProviderPlayback(PlaybackStatus.PRIVATE, detail_code="provider_private_session")
+        case "rate_limited":
+            raise ProviderError("provider_rate_limited", retry_after_seconds=30)
+        case "unreachable":
+            raise ProviderError("provider_unreachable")
+        case "forbidden":
+            raise ProviderError("provider_forbidden", retry_after_seconds=600)
+        case "reauth_required":
+            raise ProviderError("provider_reauth_required", reauth_required=True)
+        case _:
+            return demo_playback_at(moment, subject_key)
+
+
 class DemoProvider:
     name = ProviderName.DEMO
     experimental = False
 
     def __init__(self, clock: Callable[[], datetime]) -> None:
         self._clock = clock
+        # Pinned scenarios per connection (process memory, development only).
+        self._scenarios: dict[str, DemoScenario] = {}
+
+    def scenario(self, subject_key: str) -> DemoScenario:
+        return self._scenarios.get(subject_key, "live")
+
+    def set_scenario(self, subject_key: str, scenario: DemoScenario) -> None:
+        if scenario == "live":
+            self._scenarios.pop(subject_key, None)
+        else:
+            self._scenarios[subject_key] = scenario
 
     async def fetch_playback(self, credentials: Credentials, *, subject_key: str) -> FetchResult:
         del credentials  # the demo provider has no credentials
-        return FetchResult(demo_playback_at(self._clock(), subject_key))
+        scenario = self.scenario(subject_key)
+        return FetchResult(scenario_playback(scenario, self._clock(), subject_key))

@@ -1,0 +1,11 @@
+[Unit]
+Description=JustTheTwoOfUs database backup
+Requires=twoofus.service
+After=twoofus.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/twoofus/deploy
+EnvironmentFile=-/opt/twoofus/deploy/.env
+Environment=TWOOFUS_SECRETS_DIR=/run/twoofus/secrets
+ExecStart=/opt/twoofus/deploy/scripts/backup.sh

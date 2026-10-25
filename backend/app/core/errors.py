@@ -6,12 +6,17 @@ frontend can branch on stable codes instead of parsing messages.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.core.middleware import SECURITY_HEADERS
+
+logger = logging.getLogger(__name__)
 
 
 class AppError(Exception):
@@ -106,6 +111,18 @@ def install_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             error_body("validation_error", "Some fields are invalid.", details),
             status_code=422,
+        )
+
+    @app.exception_handler(Exception)
+    async def _unexpected_error(_: Request, exc: Exception) -> JSONResponse:
+        # Runs in Starlette's outermost error middleware, so it adds the API's
+        # security headers itself. Only the type is logged here; the server logs
+        # the (redacted) traceback.
+        logger.error("unhandled %s", type(exc).__name__)
+        return JSONResponse(
+            error_body("internal_error", "Something went wrong on our side. Please try again."),
+            status_code=500,
+            headers={name.decode(): value.decode() for name, value in SECURITY_HEADERS},
         )
 
     @app.exception_handler(StarletteHTTPException)

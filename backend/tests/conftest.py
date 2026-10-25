@@ -121,7 +121,6 @@ def make_settings(database_url: str, **overrides: Any) -> Settings:
         "spotify_client_id": "test-client-id",
         "spotify_redirect_uri": SPOTIFY_REDIRECT,
         "yandex_enabled": True,
-        "bootstrap_token": "",
         "log_level": "WARNING",
     }
     values.update(overrides)
@@ -149,11 +148,22 @@ class FakeYandexGateway:
     calls: Counter[str] = field(default_factory=Counter)
     tokens_seen: list[str] = field(default_factory=list)
     device_names: list[str] = field(default_factory=list)
+    device_ids: list[str] = field(default_factory=list)
+    revoke_result: bool | Exception = True
+    revoked: list[str] = field(default_factory=list)
 
-    async def request_device_code(self, *, device_name: str) -> DeviceCode:
+    async def request_device_code(self, *, device_name: str, device_id: str) -> DeviceCode:
         self.calls["device_code"] += 1
         self.device_names.append(device_name)
+        self.device_ids.append(device_id)
         return self.device_code
+
+    async def revoke_token(self, access_token: str) -> bool:
+        self.calls["revoke"] += 1
+        self.revoked.append(access_token)
+        if isinstance(self.revoke_result, Exception):
+            raise self.revoke_result
+        return self.revoke_result
 
     async def poll_device_token(self, device_code: str) -> YandexToken | None:
         self.calls["poll"] += 1

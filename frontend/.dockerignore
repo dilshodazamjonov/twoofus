@@ -1,0 +1,12 @@
+node_modules
+.next
+.next-*
+test-results
+playwright-report
+blob-report
+playwright/.auth
+coverage
+.env
+.env.*
+!.env.example
+*.tsbuildinfo

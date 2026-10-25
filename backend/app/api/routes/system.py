@@ -54,6 +54,7 @@ async def config(ctx: Ctx) -> ConfigOut:
         app_name=ctx.settings.app_name,
         environment=ctx.settings.environment,
         demo_mode=ctx.settings.demo_mode,
+        demo_controls=ctx.settings.demo_controls_enabled,
         providers={
             "spotify": ConfigProviderOut(available="spotify" in available, experimental=False),
             "yandex": ConfigProviderOut(available="yandex" in available, experimental=True),

@@ -1,6 +1,6 @@
 """The two-person now-playing view.
 
-Policy (see docs/ARCHITECTURE.md, "Polling and caching"):
+Policy:
 
 * Consent first: a partner who is not sharing is answered with ``private``
   before any provider is contacted; nothing about them is fetched or cached.
@@ -89,6 +89,7 @@ class _Entry:
     playback: ProviderPlayback
     fetched_at: datetime
     last_changed_at: datetime | None
+    refresh_due: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +124,12 @@ class NowPlayingService:
 
     def evict(self, connection_id: uuid.UUID) -> None:
         self._entries.pop(connection_id, None)
+
+    def invalidate(self, connection_id: uuid.UUID) -> None:
+        """Refresh on the next request, but keep the last state for stale display."""
+        entry = self._entries.get(connection_id)
+        if entry is not None:
+            entry.refresh_due = True
 
     # ----- public API -----------------------------------------------------
 
@@ -169,7 +176,11 @@ class NowPlayingService:
         lock = self._locks.setdefault(conn.id, asyncio.Lock())
         async with lock:
             entry = self._entries.get(conn.id)
-            if entry is not None and self._clock() - entry.fetched_at < self.ttl:
+            if (
+                entry is not None
+                and not entry.refresh_due
+                and self._clock() - entry.fetched_at < self.ttl
+            ):
                 return self._fresh(entry, flags)
             return await self._refresh(conn.id, provider, entry, flags)
 

@@ -1,0 +1,11 @@
+Official Spotify full logo (icon + wordmark), unmodified.
+
+Source: https://developer.spotify.com/images/guidelines/design/2024-spotify-full-logo.zip
+        (linked from https://developer.spotify.com/documentation/design), downloaded 2026-10-25.
+Files:  Full_Logo_Black_RGB.svg  sha256 b91219c14405166e3667deb7f250df4b939a8a5dbc8460ee9525a75672ba9ec5
+        Full_Logo_White_RGB.svg  sha256 31cdfcdd58d3533a32d287267a1c404f376749b1fc4da99e4baa2233684f053c
+
+Spotify is a trademark of Spotify AB. Used only to attribute Spotify content, as
+the Spotify Developer Terms and design guidelines require: black logo on light
+backgrounds, white logo on dark backgrounds, at least 70 px wide, clear space of
+half the logo height, never altered. See docs/PRODUCT_DESIGN.md.

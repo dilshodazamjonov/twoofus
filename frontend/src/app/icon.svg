@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- The tulip with heavier strokes for small sizes (favicon). -->
+  <style>
+    .head { stroke: #813F59; fill: #813F59 } .stem { stroke: #5E7D5A } .leaf { stroke: #5E7D5A; fill: #B7C9B5 }
+    @media (prefers-color-scheme: dark) { .head { stroke: #EBA6BB; fill: #EBA6BB } .stem { stroke: #8FA88C } .leaf { stroke: #8FA88C; fill: #8FA88C } }
+  </style>
+  <g fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path class="stem" d="M12 13.5V22"/>
+    <path class="leaf" d="M12 22c0-3 2.2-5.2 5.5-5.2 0 3-2.4 5.2-5.5 5.2Z"/>
+    <path class="head" d="M12 13.5c2.8 0 5-2.2 5-5V3.5l-2.6 2.2L12 2.5 9.6 5.7 7 3.5v5c0 2.8 2.2 5 5 5Z"/>
+  </g>
+</svg>
