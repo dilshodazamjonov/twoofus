@@ -1,0 +1,48 @@
+# ---- Secrets & local configuration (never commit) --------------------------
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# ---- Databases (never commit DB contents) ------------------------------------
+backend/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ---- Python --------------------------------------------------------------
+backend/.venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---- Node / Next.js ------------------------------------------------------
+node_modules/
+frontend/.next/
+frontend/.next-*/
+frontend/out/
+*.tsbuildinfo
+
+# ---- Project-local toolchain & script output ------------------------------
+.tools/
+.smoke/
+
+# ---- OS / editors ----------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log
