@@ -1,6 +1,7 @@
 # Free hosting: one Render web service (deploy/render/Dockerfile), database on Neon.
-# Render: New > Blueprint > this repo. It asks for DATABASE_URL (the Neon
-# connection string) and SPOTIFY_CLIENT_ID; the other secrets are generated.
+# Render: New > Blueprint > this repo. It asks for DATABASE_URL and
+# DATABASE_URL_UNPOOLED (Neon's pooled and direct connection strings; `neon env
+# pull` writes both) and SPOTIFY_CLIENT_ID; the other secrets are generated.
 # Free plan: sleeps after 15 idle minutes, the next visit wakes it (about a minute).
 services:
   - type: web
@@ -13,6 +14,8 @@ services:
     healthCheckPath: /api/v1/health
     envVars:
       - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_URL_UNPOOLED
         sync: false
       - key: SPOTIFY_CLIENT_ID
         sync: false
