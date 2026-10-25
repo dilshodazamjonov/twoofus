@@ -38,6 +38,7 @@ from app.models import User
 from app.providers.base import ProviderError
 from app.providers.yandex import (
     DeviceCode,
+    YandexHistoryTrack,
     YandexToken,
     YandexTrackMeta,
     YnisonPlayable,
@@ -145,6 +146,7 @@ class FakeYandexGateway:
         )
     )
     tracks: dict[str, YandexTrackMeta | Exception | None] = field(default_factory=dict)
+    history: tuple[YandexHistoryTrack, ...] | Exception = ()
     calls: Counter[str] = field(default_factory=Counter)
     tokens_seen: list[str] = field(default_factory=list)
     device_names: list[str] = field(default_factory=list)
@@ -190,6 +192,15 @@ class FakeYandexGateway:
         if isinstance(result, Exception):
             raise result
         return result
+
+    async def fetch_history(
+        self, access_token: str, *, limit: int
+    ) -> tuple[YandexHistoryTrack, ...]:
+        self.calls["history"] += 1
+        self.tokens_seen.append(access_token)
+        if isinstance(self.history, Exception):
+            raise self.history
+        return self.history[:limit]
 
 
 def yandex_playing(

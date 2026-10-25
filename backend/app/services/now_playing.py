@@ -13,6 +13,9 @@ Policy:
   served for at most 5 minutes, flagged ``is_stale`` and without progress.
 * The cache lives in process memory only. Playback content is never written to
   the database; only fetch timestamps and health codes are.
+* Recent songs follow the same consent rule and share the per-connection lock
+  (one token refresh at a time), with their own cache. Their failures never
+  touch the connection's health: the card above them reports that.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -36,6 +40,7 @@ from app.providers.base import (
     PlaybackStatus,
     ProviderError,
     ProviderPlayback,
+    RecentTrack,
     TokenSet,
     TrackInfo,
 )
@@ -51,6 +56,31 @@ MAX_BACKOFF_SECONDS = 300.0
 TRANSIENT_CODES = frozenset(
     {"provider_unreachable", "provider_rate_limited", "provider_quota_exceeded", "provider_backoff"}
 )
+RECENT_LIMIT = 5
+RECENT_TTL = timedelta(seconds=90)
+
+RecentState = Literal["ok", "needs_permission", "unavailable", "private", "not_connected"]
+
+
+@dataclass(frozen=True, slots=True)
+class RecentView:
+    state: RecentState
+    source: str | None = None
+    tracks: tuple[RecentTrack, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MemberRecent:
+    member: MemberInfo
+    is_me: bool
+    recent: RecentView
+
+
+@dataclass(frozen=True, slots=True)
+class _RecentEntry:
+    view: RecentView
+    fetched_at: datetime
+    token_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +145,7 @@ class NowPlayingService:
         self._session_factory = session_factory
         self._clock = clock
         self._entries: dict[uuid.UUID, _Entry] = {}
+        self._recent: dict[uuid.UUID, _RecentEntry] = {}
         self._locks: dict[uuid.UUID, asyncio.Lock] = {}
         self.upstream_calls = 0  # observability / tests
 
@@ -124,6 +155,7 @@ class NowPlayingService:
 
     def evict(self, connection_id: uuid.UUID) -> None:
         self._entries.pop(connection_id, None)
+        self._recent.pop(connection_id, None)
 
     def invalidate(self, connection_id: uuid.UUID) -> None:
         """Refresh on the next request, but keep the last state for stale display."""
@@ -184,7 +216,69 @@ class NowPlayingService:
                 return self._fresh(entry, flags)
             return await self._refresh(conn.id, provider, entry, flags)
 
+    async def room_recent(self, members: RoomMembers) -> tuple[MemberRecent, MemberRecent | None]:
+        me = await self._member_recent(members.me, is_me=True)
+        partner = (
+            await self._member_recent(members.partner, is_me=False) if members.partner else None
+        )
+        return me, partner
+
+    async def _member_recent(self, member: MemberInfo, *, is_me: bool) -> MemberRecent:
+        if not is_me and not member.sharing_enabled:
+            view = RecentView("private")
+        elif member.connection is None:
+            view = RecentView("not_connected")
+        else:
+            view = await self.recent_for(member.connection)
+        return MemberRecent(member=member, is_me=is_me, recent=view)
+
+    async def recent_for(self, conn: ConnectionRef) -> RecentView:
+        """The member's last few songs, cached for ``RECENT_TTL``."""
+        provider = self._providers.get(conn.provider)
+        if provider is None or conn.status == ConnectionStatus.REAUTH_REQUIRED.value:
+            return RecentView("unavailable", source=conn.provider)
+        lock = self._locks.setdefault(conn.id, asyncio.Lock())
+        async with lock:
+            cached = self._recent.get(conn.id)
+            if (
+                cached is not None
+                and cached.token_version == conn.token_version
+                and self._clock() - cached.fetched_at < RECENT_TTL
+            ):
+                return cached.view
+            view = await self._fetch_recent(conn.id, provider)
+            self._recent[conn.id] = _RecentEntry(view, self._clock(), conn.token_version)
+            return view
+
     # ----- internals ------------------------------------------------------
+
+    async def _fetch_recent(
+        self, connection_id: uuid.UUID, provider: PlaybackProvider
+    ) -> RecentView:
+        async with self._session_factory() as db:
+            row = await db.get(ProviderConnection, connection_id)
+            if row is None:
+                return RecentView("not_connected")
+            try:
+                credentials = self._credentials(row)
+                async with asyncio.timeout(self._settings.provider_timeout_seconds * 2 + 2):
+                    result = await provider.fetch_recent(
+                        credentials, subject_key=str(row.id), limit=RECENT_LIMIT
+                    )
+            except ProviderError as exc:
+                state: RecentState = (
+                    "needs_permission" if exc.code == "recent_not_permitted" else "unavailable"
+                )
+                return RecentView(state, source=row.provider)
+            except (DecryptionError, TimeoutError):
+                return RecentView("unavailable", source=row.provider)
+            except Exception as exc:
+                logger.error("unexpected %s recent failure: %s", row.provider, type(exc).__name__)
+                return RecentView("unavailable", source=row.provider)
+            if result.new_tokens is not None:
+                self._store_tokens(row, result.new_tokens)
+                await db.commit()
+            return RecentView("ok", source=row.provider, tracks=result.tracks)
 
     async def _refresh(
         self,
@@ -265,6 +359,7 @@ class NowPlayingService:
             access_token=dec(row.access_token_enc, "access"),
             refresh_token=dec(row.refresh_token_enc, "refresh"),
             expires_at=row.token_expires_at,
+            scopes=row.scopes,
         )
 
     def _store_tokens(self, row: ProviderConnection, tokens: TokenSet) -> None:

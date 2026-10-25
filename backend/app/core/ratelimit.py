@@ -75,3 +75,5 @@ INVITE_CREATE_PER_USER = Limit(attempts=30, window_seconds=15 * 60)
 # Tulips: a few in a row are fine; a flood is not.
 TULIP_PER_MINUTE = Limit(attempts=10, window_seconds=60)
 TULIP_PER_DAY = Limit(attempts=200, window_seconds=24 * 3600)
+# Picking a song, the shared playlist and the daily question.
+SONGS_PER_USER = Limit(attempts=60, window_seconds=15 * 60)

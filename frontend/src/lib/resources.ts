@@ -30,6 +30,22 @@ export const tulipsPoller = createPoller({
   interval: () => 25_000,
 });
 
+/** The backend caches recent songs for 90 s; picks, playlist and answers change rarely. */
+export const recentPoller = createPoller({
+  fetcher: (signal) => api.recent({ signal }),
+  interval: () => 90_000,
+});
+
+export const songsPoller = createPoller({
+  fetcher: (signal) => api.songs({ signal }),
+  interval: () => 60_000,
+});
+
+export const questionPoller = createPoller({
+  fetcher: (signal) => api.question({ signal }),
+  interval: () => 60_000,
+});
+
 /** Forget everything that belongs to the signed-in member. */
 export function clearMemberData(): void {
   roomResource.reset();
@@ -38,6 +54,9 @@ export function clearMemberData(): void {
   sessionsResource.reset();
   nowPlayingPoller.reset();
   tulipsPoller.reset();
+  recentPoller.reset();
+  songsPoller.reset();
+  questionPoller.reset();
 }
 
 // ----- session end (signed out elsewhere, expired, revoked) -------------------

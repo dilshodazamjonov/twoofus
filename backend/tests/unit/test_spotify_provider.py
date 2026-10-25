@@ -14,11 +14,13 @@ import respx
 from app.providers.base import ContentType, Credentials, PlaybackStatus, ProviderError
 from app.providers.spotify import (
     CURRENTLY_PLAYING_URL,
+    RECENTLY_PLAYED_URL,
     TOKEN_URL,
     SpotifyProvider,
     code_challenge_s256,
     new_code_verifier,
     parse_currently_playing,
+    parse_recently_played,
 )
 
 NOW = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
@@ -175,7 +177,7 @@ def test_authorize_url_uses_pkce_and_minimal_scope(provider: SpotifyProvider) ->
         "response_type": "code",
         "redirect_uri": "http://127.0.0.1:3000/api/v1/providers/spotify/callback",
         "state": "st",
-        "scope": "user-read-currently-playing",
+        "scope": "user-read-currently-playing user-read-recently-played",
         "code_challenge_method": "S256",
         "code_challenge": "ch",
     }
@@ -367,3 +369,85 @@ async def test_token_response_validation(provider: SpotifyProvider) -> None:
     )
     with pytest.raises(ProviderError):
         await provider.exchange_code("c", "v")
+
+
+# ----- recent songs -------------------------------------------------------------------
+
+
+def played(track_id: str, *, at: str = "2026-10-25T11:58:00.000Z", **item: Any) -> dict[str, Any]:
+    return {"played_at": at, "track": {**track_body()["item"], "id": track_id, **item}}
+
+
+def test_parse_recently_played_keeps_each_song_once() -> None:
+    page = {
+        "items": [
+            played("aaa111", at="2026-10-25T11:58:00Z", name="Newest"),
+            played("aaa111", at="2026-10-25T11:50:00Z", name="Newest"),
+            played("bbb222", is_local=True),
+            {"played_at": "2026-10-25T11:40:00Z", "track": {"type": "episode", "id": "c3"}},
+            played("ddd/444"),  # not a Spotify id
+            played("eee555", name="  "),
+            played("fff666", at="not a time", name="Older"),
+            played("ggg777", name="Oldest"),
+        ]
+    }
+    tracks = parse_recently_played(page, limit=2)
+    assert [t.key for t in tracks] == ["aaa111", "fff666"]
+    first = tracks[0]
+    assert first.title == "Newest"
+    assert first.artist_names == ("Artist One", "Artist Two")
+    assert first.artwork_url == "https://i.scdn.co/image/300"
+    assert first.track_url == "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"
+    assert first.played_at == datetime(2026, 10, 25, 11, 58, tzinfo=UTC)
+    assert first.played_on is None
+    assert tracks[1].played_at is None
+    with pytest.raises(ProviderError):
+        parse_recently_played({"items": "nope"}, limit=5)
+
+
+@respx.mock
+async def test_recent_without_the_scope_never_calls_spotify(provider: SpotifyProvider) -> None:
+    old_grant = Credentials(
+        "old-access", "refresh-1", NOW + timedelta(minutes=30), "user-read-currently-playing"
+    )
+    with pytest.raises(ProviderError) as excinfo:
+        await provider.fetch_recent(old_grant, subject_key="x", limit=5)
+    assert excinfo.value.code == "recent_not_permitted"
+    assert not excinfo.value.reauth_required  # playback keeps working with this grant
+
+
+@respx.mock
+async def test_recent_songs_refresh_the_token_once(provider: SpotifyProvider) -> None:
+    route = respx.get(RECENTLY_PLAYED_URL).mock(
+        side_effect=[httpx.Response(401), httpx.Response(200, json={"items": [played("aaa111")]})]
+    )
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"access_token": "new-access", "token_type": "Bearer", "expires_in": 3600},
+        )
+    )
+    result = await provider.fetch_recent(creds(), subject_key="x", limit=5)
+    assert [t.key for t in result.tracks] == ["aaa111"]
+    assert result.new_tokens is not None
+    assert result.new_tokens.access_token == "new-access"
+    request = route.calls.last.request
+    assert request.headers["Authorization"] == "Bearer new-access"
+    assert request.url.params["limit"] == "20"
+
+
+@respx.mock
+async def test_recent_songs_refused_or_unreachable(provider: SpotifyProvider) -> None:
+    respx.get(RECENTLY_PLAYED_URL).mock(
+        side_effect=[
+            httpx.Response(403),
+            httpx.Response(503),
+            httpx.Response(429, headers={"Retry-After": "7"}),
+        ]
+    )
+    codes = []
+    for _ in range(3):
+        with pytest.raises(ProviderError) as excinfo:
+            await provider.fetch_recent(creds(), subject_key="x", limit=5)
+        codes.append(excinfo.value.code)
+    assert codes == ["recent_not_permitted", "provider_unreachable", "provider_rate_limited"]

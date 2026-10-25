@@ -22,12 +22,15 @@ from app.db.base import Base
 EXPECTED_TABLES = {
     "alembic_version",
     "auth_sessions",
+    "daily_answers",
     "invitations",
+    "playlist_items",
     "provider_auth_flows",
     "provider_connections",
     "room_members",
     "rooms",
     "share_preferences",
+    "song_picks",
     "tulips",
     "users",
 }
@@ -67,11 +70,19 @@ def test_no_playback_history_table(database_url: str) -> None:
     engine = create_engine(_sync_url(database_url))
     try:
         columns = {
-            column["name"]
+            (table, column["name"])
             for table in inspect(engine).get_table_names()
             for column in inspect(engine).get_columns(table)
         }
     finally:
         engine.dispose()
-    # Privacy by design: nothing that could hold track/listening data.
-    assert not {"track_title", "artist_names", "track_url", "artwork_url", "album"} & columns
+    # Privacy by design: no listening history. Song details exist only for songs
+    # a member chose to share (a pick, the playlist), and never when or how long
+    # anyone listened.
+    track_fields = {"track_title", "artist_names", "track_url", "artwork_url", "album"}
+    assert {table for table, name in columns if name in track_fields} <= {
+        "song_picks",
+        "playlist_items",
+    }
+    listening_fields = {"played_at", "progress_ms", "duration_ms", "is_playing", "listened_at"}
+    assert not {name for _, name in columns} & listening_fields

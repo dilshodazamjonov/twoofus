@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 
 from app.models.enums import ProviderName
@@ -27,6 +27,8 @@ from app.providers.base import (
     PlaybackStatus,
     ProviderError,
     ProviderPlayback,
+    RecentResult,
+    RecentTrack,
     TrackInfo,
 )
 
@@ -212,3 +214,25 @@ class DemoProvider:
         del credentials  # the demo provider has no credentials
         scenario = self.scenario(subject_key)
         return FetchResult(scenario_playback(scenario, self._clock(), subject_key))
+
+    async def fetch_recent(
+        self, credentials: Credentials, *, subject_key: str, limit: int
+    ) -> RecentResult:
+        """A few songs from the invented playlist, a different start per member."""
+        del credentials
+        now = self._clock()
+        start = _offset_ms(subject_key) % len(DEMO_TRACKS)
+        tracks = []
+        for step in range(min(limit, len(DEMO_TRACKS))):
+            index = (start + step) % len(DEMO_TRACKS)
+            info = _track(index)
+            tracks.append(
+                RecentTrack(
+                    key=f"demo-{index}",
+                    title=info.title,
+                    artist_names=info.artist_names,
+                    artwork_url=info.artwork_url,
+                    played_at=now - timedelta(minutes=4 * (step + 1)),
+                )
+            )
+        return RecentResult(tracks=tuple(tracks))

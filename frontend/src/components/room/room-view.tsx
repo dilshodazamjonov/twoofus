@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { MemberNowPlayingOut, RoomNowPlayingOut } from "@/lib/api/types";
+import type { MemberNowPlayingOut, ProviderName, RoomNowPlayingOut } from "@/lib/api/types";
 import { describePlayback, type CardView } from "@/lib/copy/playback";
 import { firstName, formatClock, formatRelative } from "@/lib/format";
 import { nowPlayingPoller, pollIntervalMs, roomResource } from "@/lib/resources";
@@ -13,8 +13,12 @@ import { useNow } from "@/lib/store/now";
 import { usePoller, type PollState } from "@/lib/store/poller";
 import { useResource } from "@/lib/store/resource";
 
+import { DailyQuestion } from "./daily-question";
+import { ForYou } from "./for-you";
 import { InviteCard } from "./invite-card";
 import { MusicCard } from "./music-card";
+import { Playlist } from "./playlist";
+import { RecentSongs } from "./recent-songs";
 import { Tulips } from "./tulips";
 
 export function RoomView() {
@@ -63,6 +67,29 @@ export function RoomView() {
       <SongChangeAnnouncer partner={partner} view={partnerView} />
       <FreshnessLine state={nowPlaying} now={now} clientStale={clientStale} />
       {partnerName ? <Tulips partnerName={partnerName} /> : null}
+      <SongSections myName={firstName(me.display_name)} partnerName={partnerName} mine={me.playback.source ?? null} />
+    </div>
+  );
+}
+
+/** Below the cards: a song picked for you, recent songs, the playlist and today's question. */
+function SongSections({
+  myName,
+  partnerName,
+  mine,
+}: {
+  myName: string;
+  partnerName: string | null;
+  mine: ProviderName | null;
+}) {
+  return (
+    <div className="grid grid-cols-1 items-start gap-5 md:grid-cols-2 md:gap-8">
+      {partnerName ? <ForYou partnerName={partnerName} mine={mine} className="md:col-span-2" /> : null}
+      <RecentSongs partnerName={partnerName} />
+      <div className="space-y-5 md:space-y-8">
+        <Playlist mine={mine} />
+        <DailyQuestion myName={myName} partnerName={partnerName} />
+      </div>
     </div>
   );
 }

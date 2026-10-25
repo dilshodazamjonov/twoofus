@@ -485,7 +485,7 @@ def _issue_spotify(state: FakeState, *, with_refresh: bool) -> dict[str, Any]:
     body: dict[str, Any] = {
         "access_token": access,
         "token_type": "Bearer",
-        "scope": "user-read-currently-playing",
+        "scope": "user-read-currently-playing user-read-recently-played",
         "expires_in": 3600,
     }
     if with_refresh:

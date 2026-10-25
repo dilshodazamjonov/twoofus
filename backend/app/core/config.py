@@ -24,12 +24,13 @@ DEFAULT_DATABASE_URL = f"sqlite+aiosqlite:///{DEFAULT_SQLITE_PATH}"
 
 # The only callback path the backend serves; the redirect URI must point at it.
 SPOTIFY_CALLBACK_PATH = "/api/v1/providers/spotify/callback"
-# Only scope needed for GET /v1/me/player/currently-playing (verified in the
-# official OpenAPI spec). Not configurable on purpose: least privilege.
-SPOTIFY_SCOPES = ("user-read-currently-playing",)
+# The scopes for GET /v1/me/player/currently-playing and
+# /v1/me/player/recently-played (verified in the official OpenAPI spec).
+# Not configurable on purpose: least privilege.
+SPOTIFY_SCOPES = ("user-read-currently-playing", "user-read-recently-played")
 
 # Bump when the text users acknowledge before turning sharing on changes.
-SHARING_NOTICE_VERSION = "2026-10-25.2"
+SHARING_NOTICE_VERSION = "2026-10-25.3"
 
 _PLACEHOLDER_MARKERS = ("change_me", "changeme", "replace_me", "<", "example")
 

@@ -449,6 +449,110 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/room/question": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Today's question and answers */
+        get: operations["question_api_v1_room_question_get"];
+        /** Answer today's question */
+        put: operations["answer_api_v1_room_question_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/room/recent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Both members' last few songs (consent-filtered, cached) */
+        get: operations["recent_api_v1_room_recent_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/room/songs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Picked songs and the shared playlist */
+        get: operations["list_songs_api_v1_room_songs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/room/songs/pick": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Pick a recent song for the other */
+        put: operations["pick_api_v1_room_songs_pick_put"];
+        post?: never;
+        /** Take your pick back */
+        delete: operations["unpick_api_v1_room_songs_pick_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/room/songs/playlist": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Add a recent song to the playlist */
+        post: operations["add_api_v1_room_songs_playlist_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/room/songs/playlist/{item_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove a playlist song */
+        delete: operations["remove_api_v1_room_songs_playlist__item_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/room/tulips": {
         parameters: {
             query?: never;
@@ -505,6 +609,11 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AnswerIn */
+        AnswerIn: {
+            /** Answer */
+            answer: string;
+        };
         /** AuthorizeOut */
         AuthorizeOut: {
             /** Authorization Url */
@@ -752,6 +861,29 @@ export interface components {
             /** Sharing Enabled */
             sharing_enabled: boolean;
         };
+        /** MemberRecentOut */
+        MemberRecentOut: {
+            /** Is Me */
+            is_me: boolean;
+            /** Source */
+            source: ("spotify" | "yandex" | "demo") | null;
+            /**
+             * State
+             * @description needs_permission: the music service grant predates recent songs; private: not shared with you.
+             * @enum {string}
+             */
+            state: "ok" | "needs_permission" | "unavailable" | "private" | "not_connected";
+            /**
+             * Tracks
+             * @description Newest first, each song once.
+             */
+            tracks: components["schemas"]["RecentTrackOut"][];
+            /**
+             * User Id
+             * Format: uuid
+             */
+            user_id: string;
+        };
         /** PendingAuthorizationOut */
         PendingAuthorizationOut: {
             /**
@@ -825,6 +957,17 @@ export interface components {
              */
             track_url: string | null;
         };
+        /** PlaylistEntryOut */
+        PlaylistEntryOut: {
+            /** Added By Me */
+            added_by_me: boolean;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            song: components["schemas"]["SongOut"];
+        };
         /** ProfileIn */
         ProfileIn: {
             /** Display Name */
@@ -856,6 +999,24 @@ export interface components {
             /** Providers */
             providers: components["schemas"]["ProviderAvailabilityOut"][];
         };
+        /** QuestionOut */
+        QuestionOut: {
+            /**
+             * Day
+             * Format: date
+             * @description The UTC day the question belongs to.
+             */
+            day: string;
+            /** My Answer */
+            my_answer: string | null;
+            /**
+             * Partner Answer
+             * @description Only shown once you have answered too.
+             */
+            partner_answer: string | null;
+            /** Question */
+            question: string;
+        };
         /** ReadyOut */
         ReadyOut: {
             /**
@@ -873,6 +1034,32 @@ export interface components {
              * @enum {string}
              */
             status: "ready" | "not_ready";
+        };
+        /** RecentTrackOut */
+        RecentTrackOut: {
+            /** Artist Names */
+            artist_names: string[];
+            /** Artwork Url */
+            artwork_url: string | null;
+            /**
+             * Key
+             * @description Send it back to pick this song or add it to the playlist.
+             */
+            key: string;
+            /**
+             * Played At
+             * @description When it was played (Spotify).
+             */
+            played_at: string | null;
+            /**
+             * Played On
+             * @description The day it was played (Yandex reports no time).
+             */
+            played_on: string | null;
+            /** Title */
+            title: string;
+            /** Track Url */
+            track_url: string | null;
         };
         /** RevokedOut */
         RevokedOut: {
@@ -911,6 +1098,11 @@ export interface components {
             invitation?: components["schemas"]["InvitationStatusOut"] | null;
             /** Members */
             members: components["schemas"]["MemberOut"][];
+        };
+        /** RoomRecentOut */
+        RoomRecentOut: {
+            me: components["schemas"]["MemberRecentOut"];
+            partner: components["schemas"]["MemberRecentOut"] | null;
         };
         /** SessionInfoOut */
         SessionInfoOut: {
@@ -994,6 +1186,44 @@ export interface components {
              * Format: date-time
              */
             updated_at: string;
+        };
+        /** SongKeyIn */
+        SongKeyIn: {
+            /** Key */
+            key: string;
+        };
+        /** SongOut */
+        SongOut: {
+            /** Artist Names */
+            artist_names: string[];
+            /** Artwork Url */
+            artwork_url: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "spotify" | "yandex" | "demo";
+            /** Title */
+            title: string;
+            /** Track Url */
+            track_url: string | null;
+        };
+        /** SongsOut */
+        SongsOut: {
+            /** @description The song the other member picked for you. */
+            for_me: components["schemas"]["SongOut"] | null;
+            /** @description The song you picked for them. */
+            from_me: components["schemas"]["SongOut"] | null;
+            /**
+             * Playlist
+             * @description Newest first.
+             */
+            playlist: components["schemas"]["PlaylistEntryOut"][];
         };
         /** TulipOut */
         TulipOut: {
@@ -1808,6 +2038,216 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RoomNowPlayingOut"];
+                };
+            };
+        };
+    };
+    question_api_v1_room_question_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QuestionOut"];
+                };
+            };
+        };
+    };
+    answer_api_v1_room_question_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AnswerIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QuestionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    recent_api_v1_room_recent_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RoomRecentOut"];
+                };
+            };
+        };
+    };
+    list_songs_api_v1_room_songs_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SongsOut"];
+                };
+            };
+        };
+    };
+    pick_api_v1_room_songs_pick_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SongKeyIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SongsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    unpick_api_v1_room_songs_pick_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SongsOut"];
+                };
+            };
+        };
+    };
+    add_api_v1_room_songs_playlist_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SongKeyIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SongsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_api_v1_room_songs_playlist__item_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SongsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

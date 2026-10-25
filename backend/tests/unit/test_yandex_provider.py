@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -21,12 +21,14 @@ from app.providers.yandex import (
     DeviceFlowError,
     DeviceFlowPending,
     LibraryYandexGateway,
+    YandexHistoryTrack,
     YandexProvider,
     YandexToken,
     YandexTrackMeta,
     YnisonPlayable,
     YnisonSnapshot,
     _ynison_client_class,
+    history_tracks,
     music_app_credentials,
     oauth_device_id,
     snapshot_from_ynison_state,
@@ -583,3 +585,117 @@ def test_snapshot_rejects_an_unexpected_state_object() -> None:
     with pytest.raises(ProviderError) as excinfo:
         snapshot_from_ynison_state(object(), now_ms=0)
     assert excinfo.value.code == "provider_bad_response"
+
+
+# ----- recent songs (listening history) ------------------------------------------------
+
+
+def _history_json() -> dict[str, Any]:
+    def track(track_id: str, album_id: str, title: str) -> dict[str, Any]:
+        return {
+            "type": "track",
+            "data": {
+                "itemId": {"trackId": track_id, "albumId": album_id},
+                "fullModel": {
+                    "id": track_id,
+                    "title": title,
+                    "artists": [{"id": 1, "name": "Singer"}],
+                    "albums": [
+                        {
+                            "id": int(album_id),
+                            "title": "Album",
+                            "coverUri": "avatars.yandex.net/get-music-content/1/a/%%",
+                        }
+                    ],
+                },
+            },
+        }
+
+    return {
+        "historyTabs": [
+            {
+                "date": "2026-10-26",
+                "items": [
+                    {
+                        "context": {"type": "album", "data": {"itemId": {"id": "456"}}},
+                        "tracks": [
+                            track("111", "456", "Newest"),
+                            track("111", "456", "Newest"),  # played twice
+                            # beyond fullModelsCount: no details, so skipped
+                            {"type": "track", "data": {"itemId": {"trackId": "2", "albumId": "4"}}},
+                        ],
+                    }
+                ],
+            },
+            {"date": "2026-10-25", "items": [{"tracks": [track("333", "789", "Yesterday")]}]},
+        ]
+    }
+
+
+def test_history_tracks_from_real_library_models() -> None:
+    history = yandex_music.MusicHistory.de_json(_history_json(), yandex_music.ClientAsync("tok"))
+    tracks = history_tracks(history, limit=5)
+    assert [(t.track_id, t.title, t.day) for t in tracks] == [
+        ("111", "Newest", date(2026, 10, 26)),
+        ("333", "Yesterday", date(2026, 10, 25)),
+    ]
+    assert tracks[0].album_id == "456"
+    assert tracks[0].artist_names == ("Singer",)
+    assert tracks[0].cover_uri == "avatars.yandex.net/get-music-content/1/a/%%"
+    assert history_tracks(history, limit=1) == tracks[:1]
+    assert history_tracks(None, limit=5) == ()
+    with pytest.raises(ProviderError):
+        history_tracks(object(), limit=5)
+
+
+async def test_recent_songs_get_links_and_small_covers() -> None:
+    gateway = FakeYandexGateway(
+        history=(
+            YandexHistoryTrack(
+                "111",
+                "456",
+                "Song",
+                ("Singer",),
+                "avatars.yandex.net/get-music-content/1/a/%%",
+                date(2026, 10, 26),
+            ),
+            YandexHistoryTrack("222", None, "No album", (), None, None),
+        )
+    )
+    provider = make_provider(gateway)
+    result = await provider.fetch_recent(Credentials("tok", None, None), subject_key="x", limit=5)
+    first, second = result.tracks
+    assert first.key == "111"
+    assert first.track_url == "https://music.yandex.ru/album/456/track/111"
+    assert first.artwork_url == "https://avatars.yandex.net/get-music-content/1/a/200x200"
+    assert first.played_on == date(2026, 10, 26)
+    assert first.played_at is None
+    assert second.track_url is None
+    assert second.artwork_url is None
+    assert result.new_tokens is None
+    with pytest.raises(ProviderError) as excinfo:
+        await provider.fetch_recent(Credentials(None, None, None), subject_key="x", limit=5)
+    assert excinfo.value.reauth_required
+
+
+async def test_library_gateway_fetch_history(
+    monkeypatch: pytest.MonkeyPatch, lib_gateway: LibraryYandexGateway
+) -> None:
+    seen: list[Any] = []
+
+    async def fake_history(self: Any, full_models_count: int = 0, *args: Any, **kwargs: Any) -> Any:
+        seen.append((self.token, full_models_count))
+        return yandex_music.MusicHistory.de_json(_history_json(), self)
+
+    monkeypatch.setattr(yandex_music.ClientAsync, "music_history", fake_history)
+    tracks = await lib_gateway.fetch_history("tok", limit=5)
+    assert seen == [("tok", 10)]
+    assert [t.track_id for t in tracks] == ["111", "333"]
+
+    async def flaky(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise NetworkError("down")
+
+    monkeypatch.setattr(yandex_music.ClientAsync, "music_history", flaky)
+    with pytest.raises(ProviderError) as excinfo:
+        await lib_gateway.fetch_history("tok", limit=5)
+    assert excinfo.value.code == "provider_unreachable"

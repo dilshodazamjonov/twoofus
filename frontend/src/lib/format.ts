@@ -23,6 +23,16 @@ export function formatRelative(thenMs: number, nowMs: number, locale?: string): 
   return formatDate(thenMs, locale);
 }
 
+/** "yesterday", "3 days ago"… for a calendar day (YYYY-MM-DD); null for today. */
+export function formatDay(isoDay: string, nowMs: number, locale?: string): string | null {
+  const [year, month, day] = isoDay.split("-").map(Number);
+  if (!year || !month || !day) return null;
+  const now = new Date(nowMs);
+  const days = Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(year, month - 1, day)) / DAY);
+  if (days <= 0) return null;
+  return new Intl.RelativeTimeFormat(locale, { numeric: "auto", style: "short" }).format(-days, "day");
+}
+
 export function formatClock(ms: number, locale?: string): string {
   return new Intl.DateTimeFormat(locale, { hour: "numeric", minute: "2-digit" }).format(ms);
 }

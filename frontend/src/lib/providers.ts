@@ -14,6 +14,23 @@ export const PROVIDERS: Record<ProviderName, ProviderInfo> = {
   demo: { name: "demo", label: "Demo", listenLabel: "", official: false },
 };
 
-/** What the Spotify connection may access, in plain words (scope: user-read-currently-playing). */
-export const SPOTIFY_SCOPE_DESCRIPTION = "See the song you're playing right now";
-export const SPOTIFY_SCOPE = "user-read-currently-playing";
+/** What the Spotify connection may access, in plain words (scopes below). */
+export const SPOTIFY_SCOPE_DESCRIPTION = "See the song you're playing and your recently played songs";
+export const SPOTIFY_SCOPE = "user-read-currently-playing user-read-recently-played";
+
+type LinkableSong = { provider: ProviderName; title: string; artist_names: string[]; track_url: string | null };
+
+/**
+ * Where to listen to a shared song: the song itself when it comes from your
+ * own service, otherwise a search for it on yours.
+ */
+export function songLink(song: LinkableSong, mine: ProviderName | null): { href: string; label: string } | null {
+  if (mine === null || mine === "demo" || mine === song.provider) {
+    const label = PROVIDERS[song.provider].listenLabel;
+    return song.track_url && label ? { href: song.track_url, label } : null;
+  }
+  const query = encodeURIComponent([song.title, ...song.artist_names.slice(0, 1)].join(" "));
+  return mine === "spotify"
+    ? { href: `https://open.spotify.com/search/${query}`, label: "Find on Spotify" }
+    : { href: `https://music.yandex.ru/search?text=${query}`, label: "Find in Yandex Music" };
+}

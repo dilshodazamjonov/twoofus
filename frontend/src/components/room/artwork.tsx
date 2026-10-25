@@ -33,7 +33,12 @@ export function Artwork({ src, alt, className }: { src: string | null; alt: stri
           className="size-full object-contain"
         />
       ) : (
-        <div className="flex size-full items-center justify-center bg-accent-soft/60 text-accent-text" role="img" aria-label={alt}>
+        <div
+          className="flex size-full items-center justify-center bg-accent-soft/60 text-accent-text"
+          role={alt ? "img" : undefined}
+          aria-label={alt || undefined}
+          aria-hidden={alt ? undefined : true}
+        >
           <Music2 aria-hidden className="size-1/3 opacity-70" />
         </div>
       )}

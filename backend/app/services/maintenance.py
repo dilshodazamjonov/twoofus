@@ -1,4 +1,5 @@
-"""Periodic cleanup of expired rows (sessions, auth flows, invitations, tulips)."""
+"""Periodic cleanup of expired rows (sessions, auth flows, invitations, tulips,
+answers to past questions)."""
 
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.clock import Clock
 from app.models import AuthFlowStatus, AuthSession, Invitation, ProviderAuthFlow
+from app.services.questions import purge_old_answers
 from app.services.tulips import purge_expired_tulips
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,7 @@ async def purge_expired(db: AsyncSession, clock: Clock) -> None:
         )
     )
     await purge_expired_tulips(db, now)
+    await purge_old_answers(db, now)
     await db.commit()
 
 

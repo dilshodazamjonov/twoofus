@@ -18,6 +18,8 @@ What is used, and nothing else:
   handshake registers a *remote-control, non-player* device with
   ``is_currently_active=False``; no pause/next/volume/queue command is sent.
 * ``tracks([id])`` for title/artists/album of the current track only.
+* ``music-history`` (the app's "History" tab) for her last few songs. It is a
+  plain HTTP API, so it keeps working when Ynison refuses to serve.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
@@ -42,6 +44,8 @@ from app.providers.base import (
     PlaybackStatus,
     ProviderError,
     ProviderPlayback,
+    RecentResult,
+    RecentTrack,
     TrackInfo,
 )
 from app.providers.urls import YANDEX_ARTWORK_HOSTS, YANDEX_LINK_HOSTS, safe_https_url
@@ -104,6 +108,16 @@ class YandexTrackMeta:
     duration_ms: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class YandexHistoryTrack:
+    track_id: str
+    album_id: str | None
+    title: str
+    artist_names: tuple[str, ...]
+    cover_uri: str | None
+    day: date | None
+
+
 class DeviceFlowPending(Exception):
     """User has not approved yet (``authorization_pending`` / ``slow_down``)."""
 
@@ -132,6 +146,10 @@ class YandexGateway(Protocol):
     ) -> YnisonSnapshot: ...
 
     async def fetch_track(self, access_token: str, track_id: str) -> YandexTrackMeta | None: ...
+
+    async def fetch_history(
+        self, access_token: str, *, limit: int
+    ) -> tuple[YandexHistoryTrack, ...]: ...
 
 
 # ----- real gateway: Yandex ID OAuth over httpx + the yandex-music package ----------
@@ -360,6 +378,74 @@ class LibraryYandexGateway:
             duration_ms=track.duration_ms,
         )
 
+    async def fetch_history(
+        self, access_token: str, *, limit: int
+    ) -> tuple[YandexHistoryTrack, ...]:
+        from yandex_music import ClientAsync
+        from yandex_music.exceptions import UnauthorizedError, YandexMusicError
+
+        try:
+            async with asyncio.timeout(self._timeout):
+                history = await ClientAsync(access_token, base_url=self._api_base).music_history(
+                    full_models_count=limit * 2  # repeats take some of them
+                )
+        except UnauthorizedError as exc:
+            raise ProviderError(
+                "provider_reauth_required", "history unauthorized", reauth_required=True
+            ) from exc
+        except (TimeoutError, YandexMusicError, OSError) as exc:
+            raise ProviderError("provider_unreachable", "history unavailable") from exc
+        return history_tracks(history, limit)
+
+
+def history_tracks(history: object, limit: int) -> tuple[YandexHistoryTrack, ...]:
+    """Distinct songs from a ``MusicHistory``, newest day first."""
+    from yandex_music import MusicHistory, Track
+
+    if history is None:
+        return ()
+    if not isinstance(history, MusicHistory):
+        # The unofficial library changed shape: report it, never guess.
+        raise ProviderError("provider_bad_response", "unexpected music history object")
+    tracks: list[YandexHistoryTrack] = []
+    seen: set[str] = set()
+    for tab in history.history_tabs or []:
+        try:
+            day = date.fromisoformat(tab.date) if tab.date else None
+        except ValueError:
+            day = None
+        for group in tab.items or []:
+            for item in group.tracks or []:
+                data = item.data
+                model = data.full_model if data is not None else None
+                if item.type != "track" or not isinstance(model, Track) or not model.title:
+                    continue
+                ids = data.item_id if data is not None else None
+                track_id = str((ids.track_id if ids else None) or model.id or "")
+                if not _NUMERIC_ID.fullmatch(track_id) or track_id in seen:
+                    continue
+                seen.add(track_id)
+                album = model.albums[0] if model.albums else None
+                album_id = (ids.album_id if ids else None) or (
+                    str(album.id) if album is not None and album.id is not None else None
+                )
+                tracks.append(
+                    YandexHistoryTrack(
+                        track_id=track_id,
+                        album_id=album_id,
+                        title=model.title,
+                        artist_names=tuple(
+                            a.name for a in model.artists if a is not None and a.name
+                        ),
+                        cover_uri=model.cover_uri
+                        or (album.cover_uri if album is not None else None),
+                        day=day,
+                    )
+                )
+                if len(tracks) == limit:
+                    return tuple(tracks)
+    return tuple(tracks)
+
 
 def snapshot_from_ynison_state(state: object, now_ms: int) -> YnisonSnapshot:
     """Reduce a ``PutYnisonStateResponse`` to the few fields we use."""
@@ -477,14 +563,43 @@ class YandexProvider:
 
     # ----- playback -----------------------------------------------------
 
-    async def fetch_playback(self, credentials: Credentials, *, subject_key: str) -> FetchResult:
+    def _valid_token(self, credentials: Credentials) -> str:
         token = credentials.access_token
         if not token:
             raise ProviderError("provider_reauth_required", "no token", reauth_required=True)
         if credentials.expires_at is not None and credentials.expires_at <= self._clock():
             # yandex-music 3.2.2 cannot refresh tokens; the user re-approves instead.
             raise ProviderError("provider_reauth_required", "token expired", reauth_required=True)
+        return token
 
+    def _track_url(self, track_id: str, album_id: str | None) -> str | None:
+        if not (_NUMERIC_ID.fullmatch(track_id) and album_id and _NUMERIC_ID.fullmatch(album_id)):
+            return None
+        return safe_https_url(
+            f"{self._web_base}/album/{album_id}/track/{track_id}", YANDEX_LINK_HOSTS
+        )
+
+    async def fetch_recent(
+        self, credentials: Credentials, *, subject_key: str, limit: int
+    ) -> RecentResult:
+        del subject_key
+        items = await self._gateway.fetch_history(self._valid_token(credentials), limit=limit)
+        return RecentResult(
+            tracks=tuple(
+                RecentTrack(
+                    key=item.track_id,
+                    title=item.title,
+                    artist_names=item.artist_names,
+                    artwork_url=yandex_cover_url(item.cover_uri, "200x200"),
+                    track_url=self._track_url(item.track_id, item.album_id),
+                    played_on=item.day,
+                )
+                for item in items[:limit]
+            )
+        )
+
+    async def fetch_playback(self, credentials: Credentials, *, subject_key: str) -> FetchResult:
+        token = self._valid_token(credentials)
         snapshot = await self._gateway.fetch_player_state(
             token, device_id=ynison_device_id(subject_key), device_title=self._device_title
         )
@@ -532,11 +647,7 @@ class YandexProvider:
             return None
         track_id = playable.playable_id.split(":", 1)[0]
         album_id = playable.album_id or (meta.album_id if meta else None)
-        track_url = None
-        if _NUMERIC_ID.fullmatch(track_id) and album_id and _NUMERIC_ID.fullmatch(album_id):
-            track_url = safe_https_url(
-                f"{self._web_base}/album/{album_id}/track/{track_id}", YANDEX_LINK_HOSTS
-            )
+        track_url = self._track_url(track_id, album_id)
         return TrackInfo(
             title=title,
             artist_names=meta.artist_names if meta else (),

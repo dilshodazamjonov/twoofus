@@ -41,7 +41,7 @@ async def start_spotify(client: ApiClient) -> dict[str, str]:
     url = response.json()["authorization_url"]
     query = {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
     assert query["redirect_uri"] == SPOTIFY_REDIRECT
-    assert query["scope"] == "user-read-currently-playing"
+    assert query["scope"] == "user-read-currently-playing user-read-recently-played"
     assert query["code_challenge_method"] == "S256"
     assert len(query["code_challenge"]) == 43
     return query

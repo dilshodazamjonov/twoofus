@@ -9,7 +9,7 @@ layer to encrypt and persist.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Protocol
 
@@ -74,10 +74,30 @@ class ProviderPlayback:
 
 
 @dataclass(frozen=True, slots=True)
+class RecentTrack:
+    """A song from the member's own listening history, newest first."""
+
+    key: str  # the provider's track id: how a member picks this song
+    title: str
+    artist_names: tuple[str, ...] = ()
+    artwork_url: str | None = None
+    track_url: str | None = None
+    played_at: datetime | None = None  # Spotify reports the moment...
+    played_on: date | None = None  # ...Yandex only the day
+
+
+@dataclass(frozen=True, slots=True)
+class RecentResult:
+    tracks: tuple[RecentTrack, ...]
+    new_tokens: TokenSet | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Credentials:
     access_token: str | None
     refresh_token: str | None
     expires_at: datetime | None
+    scopes: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,4 +143,12 @@ class PlaybackProvider(Protocol):
     async def fetch_playback(self, credentials: Credentials, *, subject_key: str) -> FetchResult:
         """Read the current playback. ``subject_key`` is a stable, non-secret
         identifier of the connection (used by the demo provider and Ynison)."""
+        ...
+
+    async def fetch_recent(
+        self, credentials: Credentials, *, subject_key: str, limit: int
+    ) -> RecentResult:
+        """Up to ``limit`` distinct recently played songs, newest first.
+        Raises ``ProviderError("recent_not_permitted")`` when the grant does not
+        cover listening history."""
         ...

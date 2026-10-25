@@ -38,3 +38,13 @@ async def test_demo_provider_uses_injected_clock() -> None:
     result = await provider.fetch_playback(Credentials(None, None, None), subject_key="k")
     assert result.playback == demo_playback_at(T0, "k")
     assert result.new_tokens is None
+
+
+async def test_recent_songs_are_distinct_newest_first() -> None:
+    now = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
+    provider = DemoProvider(lambda: now)
+    result = await provider.fetch_recent(Credentials(None, None, None), subject_key="a", limit=3)
+    assert len({t.key for t in result.tracks}) == 3
+    times = [t.played_at for t in result.tracks]
+    assert times == sorted(times, reverse=True)  # type: ignore[type-var]
+    assert all(t.played_at is not None and t.played_at < now for t in result.tracks)

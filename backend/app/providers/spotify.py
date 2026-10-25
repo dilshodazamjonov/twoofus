@@ -3,18 +3,21 @@
 * Authorization Code with PKCE, done server-side: the code verifier never
   reaches the browser and no client secret is needed.
   https://developer.spotify.com/documentation/web-api/tutorials/code-pkce-flow
-* Scope: ``user-read-currently-playing`` only.
+* Scopes: ``user-read-currently-playing`` and ``user-read-recently-played``.
 * Playback: ``GET /v1/me/player/currently-playing``
   https://developer.spotify.com/documentation/web-api/reference/get-the-users-currently-playing-track
+* Recent songs: ``GET /v1/me/player/recently-played``
+  https://developer.spotify.com/documentation/web-api/reference/get-recently-played
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import secrets
-from collections.abc import Callable
-from datetime import datetime, timedelta
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
@@ -29,6 +32,8 @@ from app.providers.base import (
     PlaybackStatus,
     ProviderError,
     ProviderPlayback,
+    RecentResult,
+    RecentTrack,
     TokenSet,
     TrackInfo,
 )
@@ -41,8 +46,15 @@ ACCOUNTS_BASE = "https://accounts.spotify.com"
 API_BASE = "https://api.spotify.com"
 TOKEN_PATH = "/api/token"  # noqa: S105 - URL path, not a secret
 CURRENTLY_PLAYING_PATH = "/v1/me/player/currently-playing"
+RECENTLY_PLAYED_PATH = "/v1/me/player/recently-played"
 TOKEN_URL = ACCOUNTS_BASE + TOKEN_PATH
 CURRENTLY_PLAYING_URL = API_BASE + CURRENTLY_PLAYING_PATH
+RECENTLY_PLAYED_URL = API_BASE + RECENTLY_PLAYED_PATH
+# Grants from before this scope was requested keep working for playback.
+RECENT_SCOPE = "user-read-recently-played"
+# One page holds repeats; ask for more than we show.
+_RECENT_PAGE = 20
+_TRACK_ID = re.compile(r"[0-9A-Za-z]{1,64}")
 
 # Refresh a little before expiry so a request never races the deadline.
 _EXPIRY_SKEW = timedelta(seconds=60)
@@ -110,6 +122,64 @@ def _non_negative_int(value: object) -> int | None:
     return value
 
 
+def _artist_names(item: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        str(a["name"])
+        for a in item.get("artists") or []
+        if isinstance(a, dict) and isinstance(a.get("name"), str) and a["name"]
+    )
+
+
+def _timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def parse_recently_played(data: object, limit: int) -> tuple[RecentTrack, ...]:
+    """Distinct songs from a recently-played page, newest first."""
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise ProviderError("provider_bad_response", "recently-played body is not a page")
+    tracks: list[RecentTrack] = []
+    seen: set[str] = set()
+    for entry in items:
+        item = entry.get("track") if isinstance(entry, dict) else None
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "track"
+            or item.get("is_local") is True
+        ):
+            continue
+        track_id, title = item.get("id"), item.get("name")
+        if not isinstance(track_id, str) or not _TRACK_ID.fullmatch(track_id) or track_id in seen:
+            continue
+        if not isinstance(title, str) or not title.strip():
+            continue
+        seen.add(track_id)
+        raw_album = item.get("album")
+        album: dict[str, Any] = raw_album if isinstance(raw_album, dict) else {}
+        raw_external = item.get("external_urls")
+        external: dict[str, Any] = raw_external if isinstance(raw_external, dict) else {}
+        tracks.append(
+            RecentTrack(
+                key=track_id,
+                title=title,
+                artist_names=_artist_names(item),
+                artwork_url=_pick_artwork(album.get("images")),
+                track_url=safe_https_url(external.get("spotify"), SPOTIFY_LINK_HOSTS),
+                played_at=_timestamp(entry.get("played_at")),
+            )
+        )
+        if len(tracks) == limit:
+            break
+    return tuple(tracks)
+
+
 def parse_currently_playing(data: object) -> ProviderPlayback:
     """Translate a 200 response body into a provider-neutral playback state."""
     if not isinstance(data, dict):
@@ -138,11 +208,7 @@ def parse_currently_playing(data: object) -> ProviderPlayback:
             status, content_type=ContentType.OTHER, detail_code="incomplete_metadata"
         )
 
-    artists = tuple(
-        str(a["name"])
-        for a in item.get("artists") or []
-        if isinstance(a, dict) and isinstance(a.get("name"), str) and a["name"]
-    )
+    artists = _artist_names(item)
     raw_album = item.get("album")
     album: dict[str, Any] = raw_album if isinstance(raw_album, dict) else {}
     album_name = album.get("name") if isinstance(album.get("name"), str) else None
@@ -196,6 +262,7 @@ class SpotifyProvider:
         api = f"{upstream_override}/spotify/api" if upstream_override else API_BASE
         self._token_url = accounts + TOKEN_PATH
         self._currently_playing_url = api + CURRENTLY_PLAYING_PATH
+        self._recently_played_url = api + RECENTLY_PLAYED_PATH
 
     # ----- authorization -------------------------------------------------
 
@@ -304,6 +371,26 @@ class SpotifyProvider:
 
     async def fetch_playback(self, credentials: Credentials, *, subject_key: str) -> FetchResult:
         del subject_key
+        playback, new_tokens = await self._with_access_token(credentials, self._currently_playing)
+        return FetchResult(playback=playback, new_tokens=new_tokens)
+
+    async def fetch_recent(
+        self, credentials: Credentials, *, subject_key: str, limit: int
+    ) -> RecentResult:
+        del subject_key
+        if credentials.scopes is not None and RECENT_SCOPE not in credentials.scopes.split():
+            raise ProviderError("recent_not_permitted", "granted before recent songs were asked")
+
+        async def call(access_token: str) -> tuple[RecentTrack, ...]:
+            return await self._recently_played(access_token, limit)
+
+        tracks, new_tokens = await self._with_access_token(credentials, call)
+        return RecentResult(tracks=tracks, new_tokens=new_tokens)
+
+    async def _with_access_token[T](
+        self, credentials: Credentials, call: Callable[[str], Awaitable[T]]
+    ) -> tuple[T, TokenSet | None]:
+        """Run ``call`` with a valid access token, refreshing it at most once."""
         new_tokens: TokenSet | None = None
         access = credentials.access_token
         expires_at = credentials.expires_at
@@ -314,7 +401,7 @@ class SpotifyProvider:
             access = new_tokens.access_token
 
         try:
-            playback = await self._currently_playing(access)
+            return await call(access), new_tokens
         except _AccessTokenRejected:
             if new_tokens is not None:
                 # A token we just refreshed was rejected: the grant is gone.
@@ -323,12 +410,11 @@ class SpotifyProvider:
                 ) from None
             new_tokens = await self._refresh_or_reauth(credentials.refresh_token)
             try:
-                playback = await self._currently_playing(new_tokens.access_token)
+                return await call(new_tokens.access_token), new_tokens
             except _AccessTokenRejected:
                 raise ProviderError(
                     "provider_reauth_required", "refreshed token rejected", reauth_required=True
                 ) from None
-        return FetchResult(playback=playback, new_tokens=new_tokens)
 
     async def _refresh_or_reauth(self, refresh_token: str | None) -> TokenSet:
         if not refresh_token:
@@ -375,6 +461,38 @@ class SpotifyProvider:
                     retry_after_seconds=max(retry_after, _QUOTA_MIN_BACKOFF),
                 )
             raise ProviderError("provider_rate_limited", retry_after_seconds=retry_after)
+        if status >= 500:
+            raise ProviderError("provider_unreachable", f"Spotify returned {status}")
+        raise ProviderError("provider_bad_response", f"Spotify returned {status}")
+
+    async def _recently_played(self, access_token: str, limit: int) -> tuple[RecentTrack, ...]:
+        try:
+            response = await self._http.get(
+                self._recently_played_url,
+                params={"limit": _RECENT_PAGE},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        except httpx.TimeoutException as exc:
+            raise ProviderError("provider_unreachable", "recently-played timed out") from exc
+        except httpx.TransportError as exc:
+            raise ProviderError("provider_unreachable", "recently-played failed") from exc
+
+        status = response.status_code
+        if status == 200:
+            try:
+                body = response.json()
+            except ValueError as exc:
+                raise ProviderError("provider_bad_response", "body is not JSON") from exc
+            return parse_recently_played(body, limit)
+        if status == 401:
+            raise _AccessTokenRejected
+        if status == 403:
+            # The grant lacks the history scope (or the app may not read it).
+            raise ProviderError("recent_not_permitted", "Spotify refused recent songs")
+        if status == 429:
+            raise ProviderError(
+                "provider_rate_limited", retry_after_seconds=_retry_after_seconds(response)
+            )
         if status >= 500:
             raise ProviderError("provider_unreachable", f"Spotify returned {status}")
         raise ProviderError("provider_bad_response", f"Spotify returned {status}")
